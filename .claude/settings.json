@@ -1,0 +1,9 @@
+{
+  "model": "sonnet",
+  "effortLevel": "high",
+  "theme": "dark",
+  "editorMode": "normal",
+  "verbose": true,
+  "preferredNotifChannel": "ghostty",
+  "tui": "fullscreen"
+}
