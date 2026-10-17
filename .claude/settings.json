@@ -10,7 +10,7 @@
       "Edit(/docs/SPIKE_GOAL.md)",
       "Edit(/docs/tasks/**)",
       "Edit(/CLAUDE.md)",
-      "Edit(/.claude/settings.json)",
+      "Edit(/.claude/settings.json)"
     ],
     "ask": [
       "Bash(cargo install *)",
@@ -71,7 +71,7 @@
       "Bash(git status *)",
       "Bash(git log *)",
       "Bash(git diff *)",
-      "Bash(git show *)",
+      "Bash(git show *)"
     ]
   }
 }
