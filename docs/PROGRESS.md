@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status
-Current task: T3 — done (awaiting developer review and commit)
+Current task: T4 — done (awaiting developer review and commit)
 Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 
 ## Tasks
@@ -9,7 +9,7 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 - [x] T1 — Parse
 - [x] T2 — Reveal
 - [x] T3 — Projection
-- [ ] T4 — Horizontal motions
+- [x] T4 — Horizontal motions
 - [ ] T5 — Static rendering
 - [ ] T6 — Geometry, cursor, keys, click
 - [ ] T7 — Vertical motion
@@ -59,6 +59,19 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
   - One interpretation call, flagged for the developer (see F-10): the run table has one `Concealed` run per marker range and does not merge adjacent concealed markers. C-5 does not say whether runs are maximal.
   - The exhaustive fixture check memoizes on `(segment index, reveal flags)`: a projection depends only on those, so repeating one adds nothing, and it cut the suite from ~20 s to ~1 s with the same coverage. I-6 is still checked at every cursor.
   - `projection.rs` and `doc.rs` carry a module-level `#![allow(dead_code)]` like `parse.rs` and `reveal.rs`; all come off once T4+ consume the items. A `proptest-regressions/` directory created by my mutation runs was deleted, not committed (its seeds only failed against the mutated code).
+- Sign-off: developer reviewed T3, committed and merged to main on 2026-10-18.
+
+### T4 — 2026-10-18
+- Built:
+  - `src/motion.rs` — `move_horizontal(text, projections, cursor, mode, dir) -> usize` with `Direction { Left, Right }`. Resolved against the projections computed for `cursor` (snapping contract). Normal `h`/`l` go to the previous/next visible grapheme start; Insert `Left`/`Right` go to the boundary before the previous / after the next visible grapheme; no-op at either end (returns `cursor`). A grapheme is visible if its first byte is not concealed; EOL cells are visible. The caller clears `goal_x` (C-7).
+  - `src/doc.rs` — added `next_grapheme_boundary` / `prev_grapheme_boundary` (via `GraphemeCursor` over the whole text, so O(grapheme) per call; they return `None` for stray offsets instead of panicking). T8's Backspace reuses the previous-grapheme one.
+- Tests: 22 new (20 in `motion::tests`, 2 in `doc::tests`).
+  - Literal sequences on `a**b**c`: Normal `l` 0→3→4→5→6, `h` 6→3→2→1→0, Insert `Right` 0→1→4→5→6→7, Insert `Left` 7→6→3→2→1→0, each under all four policies; plus crossing segments/EOL cells/gap rows, Unicode graphemes, empty document and stray offsets.
+  - Characterization tests (do not fix): G1/G2 `h` and `l` over a plain heading, the G2 one-way door, G2 Insert `Left` from after `## `, a bold-first heading under all four policies, `***x***` under N1/N2 in both directions, and outer markers from outside; see F-13 to F-17. `insert_right_reaches_the_bar_between_adjacent_concealed_markers` confirms F-10's reachability claim.
+  - Properties: 1000 random documents with random start, mode, policy and up to 29 motions each — every step equals a brute-force oracle (concealed bytes from the run tables, graphemes from the full list), lands on a valid cursor/bar, moves in the right direction, and keeps I-6 under the new projection. A property that under G2+N1 a Normal cursor starting outside every heading marker never lands in one (1000 cases, `prop_assume!` on the start). The oracle also matches `move_horizontal` at every valid cursor and bar of `spike.md` under all four policies. Alphabet is the T3 alphabet plus `**`, `# `, `*a*` and regional-indicator atoms.
+- Verification: `cargo fmt --all -- --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓, `cargo test` ✓ (112 passed, ~1 s). Mutation check (not committed): Normal `l` not skipping its own grapheme, concealed graphemes not skipped, Insert `Right` returning the start, G2 behaving like G1, and N1 behaving like N2 each made several tests fail (the last two in `reveal` and `projection` as well as `motion`).
+- MANUAL: none (no GUI surface in T4; the keys are wired in T5/T6).
+- Notes: the characterization expectations were derived by hand from C-7 and C-4 before the first run and all matched. One expectation I got wrong while reasoning and corrected before writing the test: under N1 in `***x***\n`, `l` from 5 does not stop at 5, it jumps to the EOL cell at 7 (the concealed outer `*` at 6 is skipped); it only stops where there is no later visible grapheme. `motion.rs` carries the same module-level `#![allow(dead_code)]` as the other modules.
 
 ## Findings
 - F-1 (T1): pulldown nests `***both***` as Emphasis (outer, index 0) containing Strong (inner, index 1); the six markers split as Emphasis `[0,1)`/`[9,10)` and Strong `[1,3)`/`[7,9)` — evidence: test `both_is_a_two_level_tree`.
@@ -73,5 +86,12 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 - F-10 (T3): I-6 depends on how "concealed run" is read. With one run per marker range, I-6 holds at every valid cursor under all four policies. If adjacent concealed markers were merged into one maximal run, it would not: in `**a**__b__` an Insert bar at 5 reveals neither strong (strict rule, F-8), so the close `**` (3..5) and open `__` (5..7) are both concealed and adjacent; merged they form 3..7 with the bar strictly inside. Insert `Right` through the revealed closing `**` should reach that bar (T4 to confirm). Typing there would put text at the collapse point between two concealed markers. If the developer wants the maximal-run reading, that needs a contract change (H3), not a bug fix — evidence: test `adjacent_concealed_markers_at_a_bar_boundary`.
 - F-11 (T3): an Insert bar at `len` when the document ends with `\n` (e.g. after `abc\n`, the start of a new last line) belongs to no segment: `src_to_vis(seg.end)` is `None` for a segment with an EOL byte, because that offset belongs to the next segment and there is none. C-6 allows the bar there and C-11 has no phantom segment or row for it, so T6 (bar drawing, `VisualPos`) and T8 (Enter at the end of the document) must decide how it renders — evidence: test `trailing_concealed_marker_splits_the_end_affinities` (`src_to_vis(8) == None`).
 - F-12 (T3): the mapping properties P1–P5 and the I-6 frame invariant hold at every valid Normal cursor and Insert bar of the three fixtures under G1/G2 × N1/N2, and on the random documents above — evidence: `fixtures_hold_every_property_at_every_valid_cursor`, `all_properties_with_random_valid_cursors`, `every_cursor_on_small_documents`.
+- F-13 (T4): `h`/`l` are not inverses. In `a**b**c`, Normal `l` from 0 jumps to 3 (the concealed `**` is skipped), but `h` from 3 walks back through 2 and 1 because the cursor in the bold has revealed them. Insert is the same: `Right` from bar 1 goes to 4, `Left` from 4 goes to 3 — evidence: test `horizontal_motions_are_not_inverses_of_each_other`.
+- F-14 (T4): under G2, `h`/`l` cannot reach the markers of a plain heading. With the cursor on the heading text, `## ` is concealed, so `h` skips to the line above (or is a no-op at the start of the document) and `l` from above lands on the text. Under G1 `h` walks onto the markers (6→5→4→3), but `l` from the line above still skips them. Once a Normal cursor has started in the markers (reachable by Esc, not by `h`/`l`) and stepped out, it cannot come back — evidence: tests `g2_normal_h_cannot_reach_heading_markers`, `g1_normal_h_walks_onto_heading_markers_but_l_from_above_skips_them`, `g2_one_way_door_once_in_the_markers_h_and_l_leave_them_for_good`.
+- F-15 (T4): G2 heading-marker reachability depends on nesting. In a heading whose first child is bold (`## **b** x`), walking `h` from the text after the bold: under N2 (G1 or G2) the bold's ancestor chain reveals the heading, so the walk reaches the `## ` markers (8→5→4→3→2→1→0); under N1 (G1 or G2) it stops at 3 with the `## ` still concealed. So under G1+N1 the heading's `#` are unreachable when approaching from inside bold even though G1 alone would reveal them (extends F-7). The N2 route only works when the inline construct starts right after the opening marker — evidence: test `bold_first_heading_reaches_its_markers_only_under_n2`.
+- F-16 (T4): under G2, Insert `Left` from the bar after `## ` (offset 3 in `## Title`) is a no-op because the markers are concealed; with the bar at 2 (before the space) `Left` walks 2→1→0. Under G1 `Left` from 3 walks 3→2→1→0. This is the movement side of F-6 — evidence: test `g2_insert_left_from_after_the_space_cannot_enter_the_markers`.
+- F-17 (T4): under N1 the outer markers of `***x***` (Emphasis around Strong, F-1) are unreachable: `h` from the text stops at 1 with the `*` at 0 skipped, and `l` from 5 skips the closing `*` at 6 and jumps to the EOL cell at 7. Under N2 both are reachable (`h` to 0, `l` to 6). From outside (`a ***x***`), `l` and `h` land on `x` and skip all outer markers under every policy — evidence: tests `n1_h_cannot_reach_the_outer_marker_of_both`, `n1_l_skips_the_outer_closing_marker_of_both`, `outer_markers_are_skipped_from_outside_under_every_policy`.
+- F-18 (T4): F-10's reachability is confirmed: in `**a**__b__`, Insert `Right` from bar 2 goes 2→3→4→5, landing on the bar between two adjacent concealed markers, where I-6 holds only with one run per marker. From 5, `Right` goes to 8 and `Left` to 2 — evidence: test `insert_right_reaches_the_bar_between_adjacent_concealed_markers`.
+- F-19 (T4): horizontal motion matches an independent brute-force oracle and keeps I-6 and grapheme alignment at every step of 1000 random motion sequences, and at every valid cursor and bar of `spike.md` under all four policies. Under G2+N1 a Normal cursor starting outside every heading marker never lands in one over 1000 random sequences — evidence: tests `random_motion_sequences_match_the_oracle_and_keep_i6`, `spike_fixture_motions_match_the_oracle_everywhere`, `g2_n1_normal_motions_never_land_in_a_heading_marker`.
 
 ## Halts
