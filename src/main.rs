@@ -88,7 +88,7 @@ fn main() -> ExitCode {
     }
 
     let result = iced::application(move || App::new(source.clone()), App::update, App::view)
-        .title("marqed projection spike")
+        .title(App::title)
         .run();
     match result {
         Ok(()) => ExitCode::SUCCESS,
