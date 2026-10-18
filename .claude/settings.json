@@ -57,6 +57,8 @@
       "Bash(git -C mv *)"
     ],
     "allow": [
+      "Edit(/docs/PROGRESS.md)",
+      "Edit(/src/**)",
       "Bash(cargo fmt *)",
       "Bash(cargo fix *)",
       "Bash(cargo clippy *)",
