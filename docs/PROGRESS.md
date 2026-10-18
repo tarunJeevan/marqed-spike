@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status
-Current task: T4 — done (awaiting developer review and commit)
+Current task: T5 — done (awaiting developer review and commit)
 Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 
 ## Tasks
@@ -10,7 +10,7 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 - [x] T2 — Reveal
 - [x] T3 — Projection
 - [x] T4 — Horizontal motions
-- [ ] T5 — Static rendering
+- [x] T5 — Static rendering
 - [ ] T6 — Geometry, cursor, keys, click
 - [ ] T7 — Vertical motion
 - [ ] T8 — Insert editing and reparse loop
@@ -72,6 +72,33 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 - Verification: `cargo fmt --all -- --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓, `cargo test` ✓ (112 passed, ~1 s). Mutation check (not committed): Normal `l` not skipping its own grapheme, concealed graphemes not skipped, Insert `Right` returning the start, G2 behaving like G1, and N1 behaving like N2 each made several tests fail (the last two in `reveal` and `projection` as well as `motion`).
 - MANUAL: none (no GUI surface in T4; the keys are wired in T5/T6).
 - Notes: the characterization expectations were derived by hand from C-7 and C-4 before the first run and all matched. One expectation I got wrong while reasoning and corrected before writing the test: under N1 in `***x***\n`, `l` from 5 does not stop at 5, it jumps to the EOL cell at 7 (the concealed outer `*` at 6 is skipped); it only stops where there is no later visible grapheme. `motion.rs` carries the same module-level `#![allow(dead_code)]` as the other modules.
+- Sign-off: developer reviewed T4, committed and merged to main on 2026-10-18.
+
+### T5 — 2026-10-18
+- Built:
+  - `src/widget.rs` — `DocumentView`, a single custom `Widget<Message, Theme, iced::Renderer>` (not generic over the renderer). `layout` builds one concrete `graphics::text::Paragraph` per segment through `ParagraphCache` (bounds `(width, ∞)`, `Wrapping::Word`, `Shaping::Advanced`, spans from the projection with bold/italic fonts and per-span sizes) and stacks segments with zero spacing; `draw` renders only segments intersecting the viewport (`fill_paragraph`); `update` handles F3 (`shell.publish` + `capture_event`).
+  - `ParagraphCache` is a plain struct in the widget's tree state: content-addressed key (hash of visible text, spans, base size, width bits), `begin_pass`/`paragraph`/`end_pass`, unused entries evicted at the end of a pass, hits and misses counted per pass. `layout_document(cache, projections, width)` and `visible_segments(layout, top, bottom)` are pure functions, so T10's headless bench can reuse them.
+  - F3 overlay (own layer above the text): an outline and `index: kind` label per visible segment, plus a panel with cache hits/misses/entries and segments/drawn counts.
+  - `src/app.rs` — `App` now parses on creation and, in `view`, recomputes reveal and projections every frame for `cursor = 0`, Normal mode, with `debug_assert!(check_frame_invariant(..))` per frame (I-6). `Message::Toggle(Toggle::F3)`; `title()` shows mode and policies as the status line. `main.rs` uses `App::title`.
+- Tests: 20 new (17 in `widget::tests`, 3 in `app::tests`).
+  - `ParagraphCache` (the T5 acceptance): repeated passes with no change are all hits (3 further passes, zero misses, entry count stable); a new width misses everything and evicts the old width; entries not used in a pass are evicted; equal segments share one entry; a style change is a different key.
+  - Layout relations (no absolute pixels): stacking with zero spacing, empty segment keeps one row, heading heights order by level, `\n` is a hard row and literal `\` `n` is text, a k-line gap has k rows with a zero-width last row, blank lines inside a fence are rows, narrowing the width gives more rows (rewrap), every span has bounds, bold is not narrower than regular.
+  - Culling against a brute-force oracle plus edge cases and an empty layout; `segment_height` guard.
+  - `simulator_lays_out_draws_and_publishes_f3`: `iced_test::simulator(app.view())` builds the real `UserInterface` (runs `layout`), `snapshot` draws through the real renderer (culling, `fill_paragraph`), and `tap_key(F3)` yields `Message::Toggle(Toggle::F3)`. No window needed.
+- Verification: `cargo fmt --all -- --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓, `cargo test` ✓ (132 passed, ~2 s). Mutation check (not committed): removing the row anchor, dropping width from the cache key, disabling eviction, not resetting the pass counters, an off-by-one in culling, and removing the one-line minimum height each made tests fail (the last only after extracting `segment_height`; see Notes). Launched the debug binary (per-frame I-6 `debug_assert!` live) on all three fixtures and on `spike.md --repeat 300`: the window stays open until killed by `timeout` (exit 124) with no stderr output.
+- MANUAL: confirm in `cargo run -- fixtures/spike.md` (I cannot see the GUI):
+  - the document renders: headings are larger by level (the cursor is at 0, so the first heading shows its `# ` under G1; all other markers are concealed), bold and italic text is styled, list/fence/setext blocks appear as plain source, and the blank-line runs show as blank rows (the fixture's 1-, 2- and 3-line gaps, including the whitespace-only line, are visibly one, two and three rows tall);
+  - resizing the window rewraps the long paragraph, and its neighbours reflow with it;
+  - F3 toggles the overlay: an outline and label per segment, and a panel with cache counters; right after a toggle the panel shows hits only, and after a resize it shows misses again;
+  - scrolling works, the panel stays at the top of the visible area, and with `--repeat 300` the panel's `drawn` is far below `segments`;
+  - the title reads `marqed projection spike — Normal — G1/N1`.
+- Notes:
+  - A real layout bug found by a test and fixed: see F-20 (a k-line gap had k-1 rows). The fix is a zero-width anchor character in the paragraph only (not in `visible`), so no source or visible offset moves.
+  - The overlay does not yet show block ids (T9), concealed-collapse ticks (need T6 geometry), the perf line (T10) or the policies (they are in the title only, until F1/F2 exist). Only F3 is handled; the other toggles, the cursor, keys and click come in T6 onwards. No `ids` input to `DocumentView` yet for the same reason.
+  - `scrollable` gives its child limits with the real width and infinite height, and passes `draw` a viewport rectangle in the child's own (content) coordinate space; culling uses `viewport.y - bounds.y` as the top.
+  - The C-11 "at least one line" minimum height is unreachable through a real paragraph: for empty text cosmic-text already yields one empty row (probed). The guard stays because C-11 asks for it, and `segment_height` was extracted so a test can exercise it directly.
+  - `App` stores `version` (C-1) but nothing reads it until T8's I-8 check, so that field has a targeted `#[allow(dead_code)]`. `START_POLICY` (G1/N1) is an arbitrary starting state, not a verdict.
+  - Process slip: I used a Python snippet for one small `widget.rs` edit after saying I would use the Edit tool; the change was verified like the rest.
 
 ## Findings
 - F-1 (T1): pulldown nests `***both***` as Emphasis (outer, index 0) containing Strong (inner, index 1); the six markers split as Emphasis `[0,1)`/`[9,10)` and Strong `[1,3)`/`[7,9)` — evidence: test `both_is_a_two_level_tree`.
@@ -93,5 +120,8 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 - F-17 (T4): under N1 the outer markers of `***x***` (Emphasis around Strong, F-1) are unreachable: `h` from the text stops at 1 with the `*` at 0 skipped, and `l` from 5 skips the closing `*` at 6 and jumps to the EOL cell at 7. Under N2 both are reachable (`h` to 0, `l` to 6). From outside (`a ***x***`), `l` and `h` land on `x` and skip all outer markers under every policy — evidence: tests `n1_h_cannot_reach_the_outer_marker_of_both`, `n1_l_skips_the_outer_closing_marker_of_both`, `outer_markers_are_skipped_from_outside_under_every_policy`.
 - F-18 (T4): F-10's reachability is confirmed: in `**a**__b__`, Insert `Right` from bar 2 goes 2→3→4→5, landing on the bar between two adjacent concealed markers, where I-6 holds only with one run per marker. From 5, `Right` goes to 8 and `Left` to 2 — evidence: test `insert_right_reaches_the_bar_between_adjacent_concealed_markers`.
 - F-19 (T4): horizontal motion matches an independent brute-force oracle and keeps I-6 and grapheme alignment at every step of 1000 random motion sequences, and at every valid cursor and bar of `spike.md` under all four policies. Under G2+N1 a Normal cursor starting outside every heading marker never lands in one over 1000 random sequences — evidence: tests `random_motion_sequences_match_the_oracle_and_keep_i6`, `spike_fixture_motions_match_the_oracle_everywhere`, `g2_n1_normal_motions_never_land_in_a_heading_marker`.
+- F-20 (T5): cosmic-text's rich-text buffer (what `Paragraph::with_spans` builds) drops the empty line after a final `\n`: visible `"\n\n"` shapes into 2 lines, `"\n"` into 1, and `""` into 1. So a Gap of k source lines (visible text has k-1 newlines) came out with k-1 rows for k ≥ 2, losing the last row, which holds the segment's EOL cell (C-6: "each Gap line is a row"). Blank lines in the middle of a segment are kept. `build_paragraph` now appends a zero-width space (U+200B, not part of `visible`) when `visible` ends in `\n`; with this font the anchor row measures under half a pixel wide, so the EOL cell stays at x = 0. T6 consequences: that paragraph's last `BufferLine` holds the 3-byte anchor, so the line-start table and any `Buffer::hit` index on that line must clamp to 0. If the anchor ever gets a nonzero advance on another font, the last gap row's EOL cell moves right — evidence: tests `a_gap_of_k_source_lines_has_k_rows_and_the_last_row_is_zero_width`, `blank_lines_inside_a_raw_segment_are_rows_without_an_anchor`, `newlines_are_hard_rows_and_literal_backslash_n_is_text`.
+- F-21 (T5): the whole widget works against the real iced 0.14.0 renderer through `iced_test` with no window: `Simulator` builds the `UserInterface` (runs `layout`), `snapshot` draws, and `tap_key(F3)` yields the toggle message. Early evidence for the T10 iced_test smoke result; T10 still owns the formal entry — evidence: test `simulator_lays_out_draws_and_publishes_f3`.
+- F-22 (T5): no API in the verified surface differed from its documentation while building the widget (`Widget::layout/draw/update`, `Paragraph::with_spans`, `fill_paragraph`, `fill_quad`, `fill_text`, `with_layer`, `Shell` methods, `iced::Renderer`'s paragraph type); the code compiled first try. One source-reading note: `graphics::text::Paragraph::with_spans` always shapes with `cosmic_text::Shaping::Advanced` regardless of `Text.shaping`, which agrees with the spike's explicit `Shaping::Advanced` — evidence: `iced_graphics-0.14.0/src/text/paragraph.rs`, compile of `widget.rs`.
 
 ## Halts
