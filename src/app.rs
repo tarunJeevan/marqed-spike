@@ -38,7 +38,8 @@ pub enum Toggle {
 pub enum Message {
     MoveLeft,
     MoveRight,
-    /// A resolved move (a click, later a vertical motion) and the `goal_x` to keep.
+    /// A move the widget resolved against its layout (a click or a vertical motion) and the
+    /// `goal_x` to keep: `None` for a click, the sticky column for `j`/`k`/`Up`/`Down`.
     MoveTo {
         offset: usize,
         goal_x: Option<f32>,
@@ -72,8 +73,7 @@ pub struct App {
     parsed: ParseResult,
     /// I-1: a source byte offset on a grapheme boundary. The Normal cursor, or the Insert bar.
     cursor: usize,
-    /// The one piece of view state that is stored (C-1): read by vertical motion in T7.
-    #[allow(dead_code)]
+    /// The one piece of view state that is stored (C-1): the sticky column of vertical motion.
     goal_x: Option<f32>,
     mode: Mode,
     policy: RevealPolicy,
@@ -210,6 +210,7 @@ impl App {
             kinds,
             self.cursor,
             self.mode,
+            self.goal_x,
             self.flags,
         ))
         .into()
@@ -385,6 +386,229 @@ mod tests {
             offset: 2,
             goal_x: None,
         });
+    }
+
+    // ---- vertical motion and goal_x (C-8) ----------------------------------------------------
+
+    use crate::widget::{
+        Caret, ParagraphCache, Vertical, layout_document, space_width, vertical_target,
+    };
+
+    /// What the widget does for a vertical key, then what App does with the message: resolve
+    /// against this frame's layout, publish `MoveTo { offset, goal_x }`, apply it. Returns
+    /// whether anything moved (a no-op at the first or last row publishes nothing).
+    fn vertical(a: &mut App, cache: &mut ParagraphCache, dir: Vertical) -> bool {
+        let projections = a.projections();
+        let layout = layout_document(cache, &projections, 400.0);
+        let caret = Caret {
+            offset: a.cursor,
+            mode: a.mode,
+            goal_x: a.goal_x,
+        };
+        let target = vertical_target(&layout, &projections, &a.source, caret, dir, &space_width);
+        let moved = target.is_some();
+        if let Some((offset, goal_x)) = target {
+            a.update(Message::MoveTo {
+                offset,
+                goal_x: Some(goal_x),
+            });
+        }
+        let _ = a.view(); // the per-frame I-6 assert
+        moved
+    }
+
+    fn move_to(a: &mut App, offset: usize) {
+        a.update(Message::MoveTo {
+            offset,
+            goal_x: None,
+        });
+    }
+
+    // Three hard lines: `abcdefgh` (0..8), `ab` (9..11), `abcdefgh` (12..20); the `\n`s are
+    // at 8, 11 and 20.
+    const COLUMNS: &str = "abcdefgh\nab\nabcdefgh\n";
+
+    #[test]
+    fn goal_x_is_set_by_the_first_vertical_move_and_kept_through_a_short_line() {
+        let mut a = app(COLUMNS);
+        let mut cache = ParagraphCache::default();
+        move_to(&mut a, 6);
+        assert_eq!(a.goal_x, None);
+        // Down to the short line: its EOL cell. The column is now stored.
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        assert_eq!(a.cursor, 11);
+        let goal = a.goal_x.expect("test: the first move stores the column");
+        assert!(goal > 0.0);
+        // Down again: the stored column, not the short line's end, so back at the 7th column.
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        assert_eq!((a.cursor, a.goal_x), (18, Some(goal)));
+        // And up through the short line again.
+        assert!(vertical(&mut a, &mut cache, Vertical::Up));
+        assert_eq!((a.cursor, a.goal_x), (11, Some(goal)));
+        assert!(vertical(&mut a, &mut cache, Vertical::Up));
+        assert_eq!((a.cursor, a.goal_x), (6, Some(goal)));
+    }
+
+    #[test]
+    fn a_horizontal_motion_clears_the_column_and_the_next_vertical_move_rereads_it() {
+        let mut a = app(COLUMNS);
+        let mut cache = ParagraphCache::default();
+        move_to(&mut a, 6);
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        let stale = a.goal_x.expect("test: a column");
+        a.update(MoveRight); // 11 -> 12, the start of the last line
+        assert_eq!((a.cursor, a.goal_x), (12, None));
+        assert!(vertical(&mut a, &mut cache, Vertical::Up));
+        // Column 0 of the short line, not the stale column.
+        assert_eq!((a.cursor, a.goal_x), (9, Some(0.0)));
+        assert_ne!(a.goal_x, Some(stale));
+        // A click publishes `goal_x: None` and does the same.
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        move_to(&mut a, 3);
+        assert_eq!(a.goal_x, None);
+    }
+
+    #[test]
+    fn a_no_op_at_either_end_changes_neither_the_cursor_nor_the_column() {
+        let mut a = app("ab\ncd\n");
+        let mut cache = ParagraphCache::default();
+        // At the first row, with no column stored and with one.
+        assert!(!vertical(&mut a, &mut cache, Vertical::Up));
+        assert_eq!((a.cursor, a.goal_x), (0, None));
+        a.update(Message::MoveTo {
+            offset: 0,
+            goal_x: Some(5.0),
+        });
+        assert!(!vertical(&mut a, &mut cache, Vertical::Up));
+        assert_eq!((a.cursor, a.goal_x), (0, Some(5.0)));
+        // At the last row.
+        a.update(Message::MoveTo {
+            offset: 3,
+            goal_x: Some(5.0),
+        });
+        assert!(!vertical(&mut a, &mut cache, Vertical::Down));
+        assert_eq!((a.cursor, a.goal_x), (3, Some(5.0)));
+        // An empty document has no rows at all.
+        let mut a = app("");
+        for mode_insert in [false, true] {
+            if mode_insert {
+                a.update(EnterInsert);
+            }
+            for dir in [Vertical::Up, Vertical::Down] {
+                assert!(!vertical(&mut a, &mut cache, dir));
+                assert_eq!((a.cursor, a.goal_x), (0, None));
+            }
+        }
+    }
+
+    #[test]
+    fn the_column_survives_a_mode_change() {
+        let mut a = app(COLUMNS);
+        let mut cache = ParagraphCache::default();
+        move_to(&mut a, 6);
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        let goal = a.goal_x.expect("test: a column");
+        // `i` keeps it; the bar goes down to the nearest boundary of the stored column.
+        a.update(EnterInsert);
+        assert_eq!((a.cursor, a.goal_x), (11, Some(goal)));
+        assert!(vertical(&mut a, &mut cache, Vertical::Down));
+        assert_eq!((a.cursor, a.goal_x), (18, Some(goal)));
+        // Esc with the bar before a grapheme leaves the cursor, so it keeps the column too.
+        a.update(ExitInsert);
+        assert_eq!((a.mode, a.cursor, a.goal_x), (Mode::Normal, 18, Some(goal)));
+        assert!(vertical(&mut a, &mut cache, Vertical::Up));
+        assert_eq!((a.cursor, a.goal_x), (11, Some(goal)));
+    }
+
+    #[derive(Debug, Clone)]
+    enum VStep {
+        Up,
+        Down,
+        Left,
+        Right,
+        Insert,
+        Esc,
+        Click(prop::sample::Index),
+        Toggle(Toggle),
+    }
+
+    fn vstep() -> impl Strategy<Value = VStep> {
+        prop_oneof![
+            4 => Just(VStep::Up),
+            4 => Just(VStep::Down),
+            2 => Just(VStep::Left),
+            2 => Just(VStep::Right),
+            1 => Just(VStep::Insert),
+            1 => Just(VStep::Esc),
+            1 => any::<prop::sample::Index>().prop_map(VStep::Click),
+            1 => prop::sample::select(vec![Toggle::F1, Toggle::F2, Toggle::F3, Toggle::F4, Toggle::F5])
+                .prop_map(VStep::Toggle),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        /// `goal_x` follows the C-7/C-8 rules through any key sequence, the cursor stays a
+        /// valid position, and the per-frame I-6 assert (in `view`) never fires. The rules:
+        /// a vertical move stores the column on its first move and keeps it after; a no-op
+        /// changes nothing; every horizontal motion and every click clears it; Esc clears it
+        /// only if the cursor moved; `i` and the toggles leave it alone.
+        #[test]
+        fn goal_x_follows_the_rules_through_random_key_sequences(
+            atoms in prop::collection::vec(
+                prop::sample::select(vec![
+                    "a", "é", "e\u{301}", "👍🏽", " ", "word ", "*", "_", "#", "\n", "\n\n", "**", "# ", "*a*", "-",
+                ]),
+                0..30,
+            ),
+            steps in prop::collection::vec(vstep(), 1..40),
+        ) {
+            let text = atoms.concat();
+            let mut a = App::new(text.clone());
+            let mut cache = ParagraphCache::default();
+            for step in steps {
+                let (before_cursor, before_goal) = (a.cursor, a.goal_x);
+                match &step {
+                    VStep::Up | VStep::Down => {
+                        let dir = if matches!(step, VStep::Up) { Vertical::Up } else { Vertical::Down };
+                        let moved = vertical(&mut a, &mut cache, dir);
+                        match (moved, before_goal) {
+                            (false, _) => prop_assert_eq!((a.cursor, a.goal_x), (before_cursor, before_goal)),
+                            (true, Some(_)) => prop_assert_eq!(a.goal_x, before_goal, "the column is kept"),
+                            (true, None) => prop_assert!(a.goal_x.is_some_and(f32::is_finite)),
+                        }
+                    }
+                    VStep::Left | VStep::Right => {
+                        a.update(if matches!(step, VStep::Left) { MoveLeft } else { MoveRight });
+                        prop_assert_eq!(a.goal_x, None);
+                    }
+                    VStep::Insert => {
+                        a.update(EnterInsert);
+                        prop_assert_eq!(a.goal_x, before_goal);
+                    }
+                    VStep::Esc => {
+                        a.update(ExitInsert);
+                        if a.cursor == before_cursor {
+                            prop_assert_eq!(a.goal_x, before_goal);
+                        } else {
+                            prop_assert_eq!(a.goal_x, None);
+                        }
+                    }
+                    VStep::Click(i) => {
+                        let valid = if a.mode == Mode::Insert { insert_bars(&text) } else { normal_cursors(&text) };
+                        move_to(&mut a, valid[i.index(valid.len())]);
+                        prop_assert_eq!(a.goal_x, None);
+                    }
+                    VStep::Toggle(t) => {
+                        a.update(Message::Toggle(*t));
+                        prop_assert_eq!(a.goal_x, before_goal);
+                    }
+                }
+                let _ = a.view();
+                prop_assert!(is_valid_position(&text, a.cursor, a.mode), "{:?}: {} in {:?}", text, a.cursor, a.mode);
+            }
+        }
     }
 
     #[test]

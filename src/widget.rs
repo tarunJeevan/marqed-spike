@@ -395,6 +395,202 @@ pub fn resolve_click(
     Some(normalize_position(source, raw, mode))
 }
 
+// ---- vertical motion (pure) -----------------------------------------------------------------
+
+/// The direction of a vertical motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vertical {
+    Up,
+    Down,
+}
+
+/// What a key means as a vertical motion (C-8): Normal `j`/`k`, Insert `Down`/`Up`. These are
+/// resolved against the layout, so the widget publishes `MoveTo` rather than a plain message
+/// (and [`key_message`] does not know them).
+pub fn vertical_key(
+    mode: Mode,
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+) -> Option<Vertical> {
+    use keyboard::Key;
+    use keyboard::key::Named;
+
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match (mode, key) {
+        (Mode::Normal, Key::Character(c)) => match c.as_str() {
+            "j" => Some(Vertical::Down),
+            "k" => Some(Vertical::Up),
+            _ => None,
+        },
+        (Mode::Insert, Key::Named(Named::ArrowDown)) => Some(Vertical::Down),
+        (Mode::Insert, Key::Named(Named::ArrowUp)) => Some(Vertical::Up),
+        _ => None,
+    }
+}
+
+/// Where a vertical motion starts: the stored cursor state it reads (C-1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Caret {
+    /// The Normal cursor or Insert bar, a source byte offset (I-1).
+    pub offset: usize,
+    pub mode: Mode,
+    /// The sticky column, in widget coordinates; `None` before the first vertical motion.
+    pub goal_x: Option<f32>,
+}
+
+/// A row of the document: a segment and a row index within that segment's rows, or the tail
+/// row below the last segment (F-27), which is not a layout row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRef {
+    Segment { index: usize, row: usize },
+    Tail,
+}
+
+/// How many rows segment `si` has.
+fn row_count(layout: &DocumentLayout, projections: &[Projection], si: usize) -> usize {
+    let p = &projections[si];
+    SegmentGeometry::new(&layout.segments[si].paragraph, &p.visible, p.base_size)
+        .rows()
+        .len()
+}
+
+/// The row above or below `from`, across segment boundaries. Document rows are the layout
+/// runs of all segments in document y order (C-8), which is segment order and then row order,
+/// because segments stack with zero spacing. The tail row is below the last of them: `Up`
+/// reaches the last row from it, but nothing is below the last layout row.
+fn neighbour(
+    layout: &DocumentLayout,
+    projections: &[Projection],
+    from: RowRef,
+    dir: Vertical,
+) -> Option<RowRef> {
+    match (from, dir) {
+        (RowRef::Tail, Vertical::Down) => None,
+        (RowRef::Tail, Vertical::Up) => {
+            let index = layout.segments.len().checked_sub(1)?;
+            let row = row_count(layout, projections, index) - 1;
+            Some(RowRef::Segment { index, row })
+        }
+        (RowRef::Segment { index, row }, Vertical::Down) => {
+            if row + 1 < row_count(layout, projections, index) {
+                Some(RowRef::Segment {
+                    index,
+                    row: row + 1,
+                })
+            } else {
+                (index + 1 < layout.segments.len()).then_some(RowRef::Segment {
+                    index: index + 1,
+                    row: 0,
+                })
+            }
+        }
+        (RowRef::Segment { index, row }, Vertical::Up) => {
+            if row > 0 {
+                Some(RowRef::Segment {
+                    index,
+                    row: row - 1,
+                })
+            } else {
+                let index = index.checked_sub(1)?;
+                let row = row_count(layout, projections, index) - 1;
+                Some(RowRef::Segment { index, row })
+            }
+        }
+    }
+}
+
+/// The source offset a vertical motion lands on within one row, for a column `goal_x`, or
+/// `None` when the row has no landing spot.
+// I-6: Normal mode picks only visible cells, so a concealed marker is never a landing spot
+// (a row of nothing but concealed bytes and no EOL byte has none).
+fn land(
+    layout: &DocumentLayout,
+    projections: &[Projection],
+    source: &str,
+    (si, row): (usize, usize),
+    mode: Mode,
+    goal_x: f32,
+    space_width: &dyn Fn(f32) -> f32,
+) -> Option<usize> {
+    let p = &projections[si];
+    let geometry = SegmentGeometry::new(&layout.segments[si].paragraph, &p.visible, p.base_size);
+    let raw = match mode {
+        Mode::Normal => {
+            let vis =
+                geometry.pick_cell(row, goal_x, space_width(p.base_size), p.eol().is_some())?;
+            if vis < p.visible_len() {
+                p.vis_to_src(vis, Affinity::After)
+            } else {
+                p.eol()? // the segment's own EOL cell
+            }
+        }
+        Mode::Insert => {
+            let hit = geometry.pick_boundary(row, goal_x)?;
+            p.vis_to_src(hit.vis, hit.affinity())
+        }
+    };
+    Some(normalize_position(source, raw, mode))
+}
+
+/// A vertical motion (C-8): the offset to move to and the `goal_x` to keep, or `None` when
+/// there is no row to move to (the first row for `Up`, the last for `Down`), in which case
+/// nothing changes, `goal_x` included.
+///
+/// It is resolved against `projections`, the ones computed for the cursor before the move
+/// (the snapping contract, C-6). `goal_x` is the cursor's own x when none is stored: the left
+/// edge of its cell in Normal mode, the bar's boundary in Insert mode, in widget coordinates.
+/// The target row is the next one in the direction that has a landing spot; Normal mode picks
+/// the cell under `goal_x` or the nearest one, Insert mode the nearest boundary (see
+/// [`SegmentGeometry::pick_cell`] and [`SegmentGeometry::pick_boundary`]).
+// I-1: the result is a source offset; `goal_x` is the one view coordinate that is kept.
+pub fn vertical_target(
+    layout: &DocumentLayout,
+    projections: &[Projection],
+    source: &str,
+    caret: Caret,
+    dir: Vertical,
+    space_width: &dyn Fn(f32) -> f32,
+) -> Option<(usize, f32)> {
+    let (mut at, x) = match owner(projections, caret.offset) {
+        Some((si, here)) => {
+            let p = &projections[si];
+            let geometry =
+                SegmentGeometry::new(&layout.segments[si].paragraph, &p.visible, p.base_size);
+            let place = geometry.locate(here.vis);
+            (
+                RowRef::Segment {
+                    index: si,
+                    row: place.row,
+                },
+                place.x,
+            )
+        }
+        // An Insert bar at the end of a text that ends in an EOL byte sits on the tail row.
+        None if caret.mode == Mode::Insert && layout.tail > 0.0 => (RowRef::Tail, 0.0),
+        None => return None,
+    };
+    let goal_x = caret.goal_x.unwrap_or(x);
+    while let Some(next) = neighbour(layout, projections, at, dir) {
+        if let RowRef::Segment { index, row } = next
+            && let Some(offset) = land(
+                layout,
+                projections,
+                source,
+                (index, row),
+                caret.mode,
+                goal_x,
+                space_width,
+            )
+        {
+            return Some((offset, goal_x));
+        }
+        at = next;
+    }
+    None
+}
+
 // ---- the widget -------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -421,6 +617,7 @@ pub struct DocumentView<'a> {
     kinds: Vec<SegmentKind>,
     cursor: usize,
     mode: Mode,
+    goal_x: Option<f32>,
     flags: DebugFlags,
 }
 
@@ -431,6 +628,7 @@ impl<'a> DocumentView<'a> {
         kinds: Vec<SegmentKind>,
         cursor: usize,
         mode: Mode,
+        goal_x: Option<f32>,
         flags: DebugFlags,
     ) -> Self {
         Self {
@@ -439,6 +637,7 @@ impl<'a> DocumentView<'a> {
             kinds,
             cursor,
             mode,
+            goal_x,
             flags,
         }
     }
@@ -525,6 +724,30 @@ impl Widget<Message, Theme, iced::Renderer> for DocumentView<'_> {
             }) => {
                 if let Some(message) = key_message(self.mode, modified_key, *modifiers) {
                     shell.publish(message);
+                    shell.capture_event();
+                } else if let Some(dir) = vertical_key(self.mode, modified_key, *modifiers) {
+                    // Resolved here, against this frame's layout (C-8); a no-op at the first
+                    // or last row publishes nothing, so `goal_x` is left alone.
+                    let state = tree.state.downcast_ref::<State>();
+                    let caret = Caret {
+                        offset: self.cursor,
+                        mode: self.mode,
+                        goal_x: self.goal_x,
+                    };
+                    let target = vertical_target(
+                        &state.layout,
+                        &self.projections,
+                        self.source,
+                        caret,
+                        dir,
+                        &|size| state.space_width(size),
+                    );
+                    if let Some((offset, goal_x)) = target {
+                        shell.publish(Message::MoveTo {
+                            offset,
+                            goal_x: Some(goal_x),
+                        });
+                    }
                     shell.capture_event();
                 }
             }
@@ -1494,6 +1717,679 @@ mod tests {
         }
     }
 
+    // ---- vertical motion ---------------------------------------------------------------------
+
+    use Vertical::{Down, Up};
+
+    fn caret(offset: usize, mode: Mode) -> Caret {
+        Caret {
+            offset,
+            mode,
+            goal_x: None,
+        }
+    }
+
+    /// One vertical move, resolved against the projections for the caret itself.
+    fn vmove(
+        cache: &mut ParagraphCache,
+        text: &str,
+        c: Caret,
+        dir: Vertical,
+        width: f32,
+    ) -> Option<(usize, f32)> {
+        let (projs, layout) = at(cache, text, c.offset, c.mode, width);
+        vertical_target(&layout, &projs, text, c, dir, &space_width)
+    }
+
+    /// Applies the directions the way App does: a move stores its offset and `goal_x`, a
+    /// no-op changes nothing. Returns the caret after each step.
+    fn walk(text: &str, start: Caret, dirs: &[Vertical], width: f32) -> Vec<Caret> {
+        let mut cache = ParagraphCache::default();
+        let mut c = start;
+        dirs.iter()
+            .map(|&dir| {
+                if let Some((offset, goal)) = vmove(&mut cache, text, c, dir, width) {
+                    c = Caret {
+                        offset,
+                        goal_x: Some(goal),
+                        ..c
+                    };
+                }
+                c
+            })
+            .collect()
+    }
+
+    fn offsets(carets: &[Caret]) -> Vec<usize> {
+        carets.iter().map(|c| c.offset).collect()
+    }
+
+    #[test]
+    fn vertical_keys_by_mode_and_modifiers() {
+        let none = keyboard::Modifiers::empty();
+        for (mode, key, want) in [
+            (Mode::Normal, ch("j"), Some(Down)),
+            (Mode::Normal, ch("k"), Some(Up)),
+            (Mode::Normal, Key::Named(Named::ArrowDown), None),
+            (Mode::Normal, Key::Named(Named::ArrowUp), None),
+            (Mode::Normal, ch("J"), None),
+            (Mode::Insert, Key::Named(Named::ArrowDown), Some(Down)),
+            (Mode::Insert, Key::Named(Named::ArrowUp), Some(Up)),
+            (Mode::Insert, ch("j"), None),
+            (Mode::Insert, ch("k"), None),
+            (Mode::Insert, Key::Named(Named::Escape), None),
+        ] {
+            assert_eq!(vertical_key(mode, &key, none), want, "{mode:?} {key:?}");
+        }
+        for modifiers in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ] {
+            assert_eq!(vertical_key(Mode::Normal, &ch("j"), modifiers), None);
+            let down = Key::Named(Named::ArrowDown);
+            assert_eq!(vertical_key(Mode::Insert, &down, modifiers), None);
+        }
+        // The plain-message keys do not know the vertical ones, and the reverse.
+        assert_eq!(key_message(Mode::Normal, &ch("j"), none), None);
+        assert_eq!(
+            key_message(Mode::Insert, &Key::Named(Named::ArrowDown), none),
+            None
+        );
+        assert_eq!(vertical_key(Mode::Normal, &ch("l"), none), None);
+    }
+
+    #[test]
+    fn gap_rows_are_rows_and_segment_boundaries_are_crossed() {
+        // Paragraph `a\n` (0..2), a two-line Gap (2..4), paragraph `b\n` (4..6).
+        let text = "a\n\n\nb\n";
+        let down = walk(text, caret(0, Mode::Normal), &[Down; 5], 400.0);
+        // Each gap line is a row; its EOL cell is the landing spot. Then `b`, then no-op.
+        assert_eq!(offsets(&down), [2, 3, 4, 4, 4]);
+        let up = walk(text, caret(4, Mode::Normal), &[Up; 5], 400.0);
+        assert_eq!(offsets(&up), [3, 2, 0, 0, 0]);
+        // Insert reaches the same rows: the bar at the start of each, then at `b`.
+        let down = walk(text, caret(0, Mode::Insert), &[Down; 4], 400.0);
+        assert_eq!(offsets(&down), [2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn goal_x_is_sticky_across_a_short_line() {
+        // One paragraph of three hard lines; the middle one is short.
+        let text = "abcdefgh\nab\nabcdefgh\n";
+        let steps = walk(text, caret(6, Mode::Normal), &[Down, Down, Up, Up], 400.0);
+        // `g`, then the short line's EOL cell (its `\n`), then `g` again, and back.
+        assert_eq!(offsets(&steps), [11, 18, 11, 6]);
+        let goal = steps[0].goal_x.expect("test: a goal");
+        assert!(goal > 0.0);
+        for c in &steps {
+            assert_eq!(c.goal_x, Some(goal), "the column is kept, not re-read");
+        }
+    }
+
+    #[test]
+    fn past_the_line_end_normal_lands_on_the_eol_cell_or_the_last_grapheme() {
+        // `abcdef\n` (0..7), a one-line Gap (7..8), `xy` with no EOL byte (8..10).
+        let text = "abcdef\n\nxy";
+        let steps = walk(text, caret(5, Mode::Normal), &[Down, Down, Up, Up], 400.0);
+        // The gap's EOL byte; then `xy` has no EOL byte, so its last grapheme; and back.
+        assert_eq!(offsets(&steps), [7, 9, 7, 5]);
+        // A long line to a short one with an EOL byte: the EOL cell, not the last grapheme.
+        let steps = walk("abcdef\nab\n", caret(5, Mode::Normal), &[Down], 400.0);
+        assert_eq!(offsets(&steps), [9]);
+    }
+
+    #[test]
+    fn insert_past_the_line_end_lands_before_the_eol_byte() {
+        let text = "abcdef\nab\nabcdefgh";
+        // The bar after `abcde` (5): a short line gives its end, before the `\n`.
+        let steps = walk(text, caret(5, Mode::Insert), &[Down, Down, Up], 400.0);
+        assert_eq!(offsets(&steps), [9, 15, 9]);
+        // The last line has no EOL byte: past its end is the end of the text.
+        let far = Caret {
+            goal_x: Some(1000.0),
+            ..caret(9, Mode::Insert)
+        };
+        let mut cache = ParagraphCache::default();
+        let (got, _) = vmove(&mut cache, text, far, Down, 400.0).expect("test: a move");
+        assert_eq!(got, text.len());
+    }
+
+    #[test]
+    fn normal_landing_skips_concealed_markers() {
+        // I-6: a concealed marker is zero-width to motions.
+        let text = "abcdefghij\n\n**bold**\n";
+        let bold = text.find("bold").expect("test: bold");
+        // From column 0, `j` twice: the gap, then the first visible cell, not the `**`.
+        let steps = walk(text, caret(0, Mode::Normal), &[Down, Down], 400.0);
+        assert_eq!(offsets(&steps), [bold - 3, bold]);
+        // From far right: the EOL cell, not the concealed closing `**` before it.
+        let far = Caret {
+            goal_x: Some(1000.0),
+            ..caret(11, Mode::Normal)
+        };
+        let mut cache = ParagraphCache::default();
+        let (got, _) = vmove(&mut cache, text, far, Down, 400.0).expect("test: a move");
+        assert_eq!(got, text.len() - 1);
+        // And upward from the EOL cell: the gap row above it.
+        let up = Caret {
+            goal_x: Some(0.0),
+            ..caret(text.len() - 1, Mode::Normal)
+        };
+        let (got, _) = vmove(&mut cache, text, up, Up, 400.0).expect("test: a move");
+        assert_eq!(got, text.find('\n').expect("test: newline") + 1);
+    }
+
+    #[test]
+    fn insert_affinity_across_a_concealed_run_follows_the_goal() {
+        // `a **b** c` is concealed (the bar is in the gap above); its collapse point is the
+        // boundary between ` ` and `b`.
+        let text = "xxxxxxxxxxxx\n\na **b** c\n";
+        let (projs, layout) = at(
+            &mut ParagraphCache::default(),
+            text,
+            13,
+            Mode::Insert,
+            400.0,
+        );
+        let p = &projs[2];
+        let collapse = SegmentGeometry::new(&layout.segments[2].paragraph, &p.visible, p.base_size)
+            .locate(2)
+            .x;
+        let line = text.find("a **").expect("test: line");
+        let mut cache = ParagraphCache::default();
+        for (goal, want) in [
+            // Left of the collapse point: before the run, at the start of the strong.
+            (collapse - 0.5, line + 2),
+            // At or right of it: after the run, strictly inside the strong.
+            (collapse, line + 4),
+            (collapse + 0.4, line + 4),
+        ] {
+            let c = Caret {
+                goal_x: Some(goal),
+                ..caret(13, Mode::Insert)
+            };
+            let (got, _) = vmove(&mut cache, text, c, Down, 400.0).expect("test: a move");
+            assert_eq!(got, want, "goal {goal} (collapse at {collapse})");
+        }
+    }
+
+    #[test]
+    fn the_first_and_last_rows_are_no_ops_and_so_is_an_empty_document() {
+        let mut cache = ParagraphCache::default();
+        let text = include_str!("../fixtures/spike.md");
+        assert_eq!(
+            vmove(&mut cache, text, caret(0, Mode::Normal), Up, 700.0),
+            None
+        );
+        let last = crate::doc::normal_cursors(text)
+            .pop()
+            .expect("test: a cursor");
+        assert_eq!(
+            vmove(&mut cache, text, caret(last, Mode::Normal), Down, 700.0),
+            None
+        );
+        // A document of one row.
+        for (text, mode) in [("abc", Mode::Normal), ("abc", Mode::Insert)] {
+            for dir in [Up, Down] {
+                assert_eq!(vmove(&mut cache, text, caret(1, mode), dir, 400.0), None);
+            }
+        }
+        for mode in [Mode::Normal, Mode::Insert] {
+            for dir in [Up, Down] {
+                assert_eq!(vmove(&mut cache, "", caret(0, mode), dir, 400.0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn the_tail_row_is_reached_by_up_only() {
+        // F-27: the tail row is not a layout row, so nothing is below the last row, but a bar
+        // that sits on it can move up to the last row.
+        let text = "ab\n";
+        let mut cache = ParagraphCache::default();
+        assert_eq!(
+            vmove(&mut cache, text, caret(0, Mode::Insert), Down, 400.0),
+            None
+        );
+        assert_eq!(
+            vmove(&mut cache, text, caret(2, Mode::Insert), Down, 400.0),
+            None
+        );
+        let (_, layout) = at(&mut cache, text, 3, Mode::Insert, 400.0);
+        assert!(layout.tail > 0.0);
+        assert_eq!(
+            vmove(&mut cache, text, caret(3, Mode::Insert), Down, 400.0),
+            None
+        );
+        // Up from the tail: the last row, at the tail bar's x (the left edge).
+        assert_eq!(
+            vmove(&mut cache, text, caret(3, Mode::Insert), Up, 400.0),
+            Some((0, 0.0))
+        );
+        // And with a stored column it lands there.
+        let c = Caret {
+            goal_x: Some(1000.0),
+            ..caret(3, Mode::Insert)
+        };
+        assert_eq!(vmove(&mut cache, text, c, Up, 400.0), Some((2, 1000.0)));
+    }
+
+    /// Every layout row of the document as `(segment, top)`, in document order (C-8:
+    /// `segment y + row top`).
+    fn doc_rows(layout: &DocumentLayout, projs: &[Projection]) -> Vec<(usize, f32)> {
+        let mut rows = Vec::new();
+        for (si, (s, p)) in layout.segments.iter().zip(projs).enumerate() {
+            let geometry = SegmentGeometry::new(&s.paragraph, &p.visible, p.base_size);
+            rows.extend(geometry.rows().iter().map(|r| (si, s.y + r.top)));
+        }
+        for pair in rows.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "rows are y-ordered: {rows:?}");
+        }
+        rows
+    }
+
+    #[test]
+    fn wrapped_rows_are_visited_in_order_and_back() {
+        let text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj\n";
+        for width in [60.0, 90.0, 150.0] {
+            let (projs, layout) = at(&mut ParagraphCache::default(), text, 0, Mode::Normal, width);
+            let n = doc_rows(&layout, &projs).len();
+            assert!(n >= 3, "the paragraph wraps at {width}: {n} rows");
+            for mode in [Mode::Normal, Mode::Insert] {
+                let mut cache = ParagraphCache::default();
+                let mut c = caret(0, mode);
+                let mut tops = vec![];
+                for _ in 0..n - 1 {
+                    let (offset, goal) =
+                        vmove(&mut cache, text, c, Down, width).expect("test: a row below");
+                    c = Caret {
+                        offset,
+                        goal_x: Some(goal),
+                        ..c
+                    };
+                    let (projs, layout) = at(&mut cache, text, offset, mode, width);
+                    tops.push(
+                        rect_of(&layout, &projs, offset, mode)
+                            .expect("test: rect")
+                            .y,
+                    );
+                }
+                assert_eq!(
+                    vmove(&mut cache, text, c, Down, width),
+                    None,
+                    "{width} {mode:?}"
+                );
+                assert!(tops.windows(2).all(|w| w[1] > w[0]), "{tops:?}");
+                for _ in 0..n - 1 {
+                    let (offset, goal) =
+                        vmove(&mut cache, text, c, Up, width).expect("test: a row above");
+                    c = Caret {
+                        offset,
+                        goal_x: Some(goal),
+                        ..c
+                    };
+                }
+                assert_eq!(
+                    vmove(&mut cache, text, c, Up, width),
+                    None,
+                    "{width} {mode:?}"
+                );
+                assert_eq!(c.offset, 0, "back at the start: {width} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn heading_rows_are_crossed_by_column_not_by_offset() {
+        // Heading cells are wider than body cells, so the same column is a different
+        // grapheme on each side.
+        let text = "# Heading text here\n\nbody text that is quite a bit longer than the title\n";
+        let mut cache = ParagraphCache::default();
+        let body = text.find("body").expect("test: body");
+        // From the 9th body grapheme up to the heading: a column near 9 body cells in.
+        let start = caret(body + 9, Mode::Normal);
+        let (projs, layout) = at(&mut cache, text, start.offset, Mode::Normal, 600.0);
+        let (gap, goal) =
+            vertical_target(&layout, &projs, text, start, Up, &space_width).expect("test: the gap");
+        let next = Caret {
+            offset: gap,
+            goal_x: Some(goal),
+            ..start
+        };
+        let (up, _) = vmove(&mut cache, text, next, Up, 600.0).expect("test: the heading");
+        assert!(
+            up < text.find('\n').expect("test: newline"),
+            "{up} is on the heading"
+        );
+        // The heading cell holding the column is wider than a body cell, so it is an earlier
+        // grapheme than the 9th.
+        assert!(up < 9, "{up}");
+        // The cell it landed on holds the column.
+        let (projs, layout) = at(&mut cache, text, gap, Mode::Normal, 600.0);
+        let r = rect_of(&layout, &projs, up, Mode::Normal).expect("test: rect");
+        assert!(r.x <= goal && goal < r.x + r.width, "{r:?} holds {goal}");
+        // And back down to the body line, at the same column.
+        let down = Caret {
+            offset: up,
+            goal_x: Some(goal),
+            ..start
+        };
+        let (back, _) = vmove(&mut cache, text, down, Down, 600.0).expect("test: the gap");
+        assert_eq!(back, gap);
+    }
+
+    #[test]
+    fn a_wrap_without_swallowed_whitespace_cannot_be_the_end_of_the_upper_row() {
+        // F-26: a boundary at a wrap with no swallowed whitespace belongs to the row that
+        // starts there. Moving up from the second row to a column past the first row's end
+        // therefore lands on the last boundary the first row owns, one grapheme before the
+        // second row's start. (`Wrapping::Word` does not break a long word, so the text wraps
+        // after its hyphens instead.)
+        let text = "aaaa-bbbb-cccc-dddd-eeee-ffff-gggg";
+        let mut checked = 0;
+        for width in [50.0, 70.0, 100.0] {
+            let mut cache = ParagraphCache::default();
+            let (projs, layout) = at(&mut cache, text, 0, Mode::Insert, width);
+            if doc_rows(&layout, &projs).len() < 2 {
+                continue;
+            }
+            let (start, _) =
+                vmove(&mut cache, text, caret(0, Mode::Insert), Down, width).expect("test: row 1");
+            let far = Caret {
+                goal_x: Some(1000.0),
+                ..caret(start, Mode::Insert)
+            };
+            let (end, _) = vmove(&mut cache, text, far, Up, width).expect("test: row 0");
+            assert_eq!(end + 1, start, "width {width}");
+            checked += 1;
+        }
+        assert!(checked > 0, "some width wraps the text");
+    }
+
+    #[test]
+    fn boundaries_sharing_a_position_pick_the_first() {
+        // F-23: several spaces swallowed at a soft wrap share one position, the end of the
+        // upper row. A column past it picks the first of them, as a Normal cell (they are
+        // equally near) and as an Insert boundary. (One hard line, nothing concealed, so
+        // visible and source offsets agree.)
+        let text = "ab  cd  ef  gh\n";
+        let mut checked = 0;
+        for (mode, width) in [Mode::Insert, Mode::Normal]
+            .into_iter()
+            .flat_map(|m| (10..120).map(move |w| (m, w as f32)))
+        {
+            let mut cache = ParagraphCache::default();
+            let (projs, layout) = at(&mut cache, text, 0, mode, width);
+            let p = &projs[0];
+            let g = SegmentGeometry::new(&layout.segments[0].paragraph, &p.visible, p.base_size);
+            let rows = g.rows();
+            if rows.len() < 2 {
+                continue;
+            }
+            // The upper row's boundaries that share the position of its last one.
+            let end = rows[0].vis_end;
+            let edge = g.locate(end - 1).x;
+            let first = (rows[0].vis_start..end)
+                .find(|&b| g.locate(b).x == edge)
+                .expect("test: the last boundary shares its own position");
+            if end - first < 2 {
+                continue; // this width does not wrap inside a run of spaces
+            }
+            let far = Caret {
+                goal_x: Some(1000.0),
+                ..caret(end, mode)
+            };
+            let (got, _) = vmove(&mut cache, text, far, Up, width).expect("test: row 0");
+            assert_eq!(got, first, "{mode:?} width {width}: rows {rows:?}");
+            checked += 1;
+        }
+        assert!(checked > 0, "some width wraps inside a run of spaces");
+    }
+
+    #[test]
+    fn a_row_with_no_landing_spot_is_skipped() {
+        // The last segment is a heading `#` with no EOL byte. Concealed, its visible text is
+        // empty, so Normal mode has no cell on that row (I-6: a concealed marker is zero-width
+        // to motions) and `j` from the gap above is a no-op. Insert mode can still put the bar
+        // after the `#`, so it lands there.
+        let text = "a\n\n#";
+        let normal = walk(text, caret(0, Mode::Normal), &[Down, Down], 400.0);
+        assert_eq!(offsets(&normal), [2, 2]);
+        let insert = walk(text, caret(0, Mode::Insert), &[Down, Down], 400.0);
+        assert_eq!(offsets(&insert), [2, 4]);
+    }
+
+    // ---- the oracle -------------------------------------------------------------------------
+
+    /// Where `o` sits under `projs` as `(segment, row top, x, cell width)`; the width is 0
+    /// for a bar. `None` for the tail bar, which no segment owns.
+    fn spot(
+        layout: &DocumentLayout,
+        projs: &[Projection],
+        o: usize,
+        mode: Mode,
+    ) -> Option<(usize, f32, f32, f32)> {
+        let (si, at) = owner(projs, o)?;
+        let (s, p) = (&layout.segments[si], &projs[si]);
+        let geometry = SegmentGeometry::new(&s.paragraph, &p.visible, p.base_size);
+        Some(match mode {
+            Mode::Normal => {
+                let c = geometry.cell(at.vis, space_width(p.base_size));
+                (si, s.y + c.top, c.x, c.width)
+            }
+            Mode::Insert => {
+                let l = geometry.locate(at.vis);
+                (si, s.y + l.top, l.x, 0.0)
+            }
+        })
+    }
+
+    /// Whether `o` is a position I-6 forbids under `projs`: a Normal cursor on a concealed
+    /// byte, or an Insert bar strictly inside a concealed run.
+    fn forbidden(projs: &[Projection], o: usize, mode: Mode) -> bool {
+        projs.iter().flat_map(|p| &p.runs).any(|run| match run {
+            Run::Concealed { src } if mode == Mode::Normal => src.contains(&o),
+            Run::Concealed { src } => src.start < o && o < src.end,
+            _ => false,
+        })
+    }
+
+    /// The offsets a vertical move may land on, found by brute force: every valid position
+    /// that I-6 allows and that sits on the target row, chosen by the C-8 rule. `None` when
+    /// no row in that direction has a landing spot. Also the `goal_x` it must keep.
+    fn expected(
+        text: &str,
+        projs: &[Projection],
+        layout: &DocumentLayout,
+        c: Caret,
+        dir: Vertical,
+    ) -> (Option<Vec<usize>>, f32) {
+        let rows = doc_rows(layout, projs);
+        let valid = if c.mode == Mode::Insert {
+            crate::doc::insert_bars(text)
+        } else {
+            crate::doc::normal_cursors(text)
+        };
+        let (here, x) = match spot(layout, projs, c.offset, c.mode) {
+            Some((_, y, x, _)) => (
+                rows.iter()
+                    .position(|r| (r.1 - y).abs() < 0.01)
+                    .expect("test: a row"),
+                x,
+            ),
+            None => (rows.len(), 0.0), // the tail bar
+        };
+        let goal = c.goal_x.unwrap_or(x);
+        let mut i = here as isize;
+        loop {
+            i += if dir == Down { 1 } else { -1 };
+            let Some(&(segment, y)) = usize::try_from(i).ok().and_then(|i| rows.get(i)) else {
+                return (None, goal);
+            };
+            let cands: Vec<(usize, f32, f32)> = valid
+                .iter()
+                .filter(|&&o| owner(projs, o).map(|(s, _)| s) == Some(segment))
+                .filter(|&&o| !forbidden(projs, o, c.mode))
+                .filter_map(|&o| {
+                    let (_, yy, x, w) = spot(layout, projs, o, c.mode)?;
+                    ((yy - y).abs() < 0.01).then_some((o, x, w))
+                })
+                .collect();
+            if cands.is_empty() {
+                continue;
+            }
+            let column = goal + crate::geometry::COLUMN_EPS;
+            let picked: Vec<usize> = match c.mode {
+                // The cell `[x, x + w)` holding the column, else the nearest (the first on a tie).
+                Mode::Normal => {
+                    let distance = |&(_, x, w): &(usize, f32, f32)| {
+                        if column < x {
+                            x - column
+                        } else {
+                            column - (x + w)
+                        }
+                    };
+                    let nearest = cands.iter().map(distance).fold(f32::INFINITY, f32::min);
+                    let holding = cands
+                        .iter()
+                        .find(|&&(_, x, w)| x <= column && column < x + w);
+                    let first =
+                        holding.or_else(|| cands.iter().find(|cand| distance(cand) == nearest));
+                    first.map(|&(o, ..)| vec![o]).unwrap_or_default()
+                }
+                // Every boundary equally near: shared positions and exact ties.
+                Mode::Insert => {
+                    // C-8: the boundary nearest `goal_x` itself (the tolerance is only for
+                    // cell edges and affinity).
+                    let bar = |&(_, x, _): &(usize, f32, f32)| (goal - x).abs();
+                    let least = cands.iter().map(bar).fold(f32::INFINITY, f32::min);
+                    cands
+                        .iter()
+                        .filter(|cand| (bar(cand) - least).abs() < 1e-3)
+                        .map(|&(o, ..)| o)
+                        .collect()
+                }
+            };
+            return (Some(picked), goal);
+        }
+    }
+
+    /// One move against the oracle, plus the frame invariant after it. Returns the new caret.
+    fn check_vertical(
+        cache: &mut ParagraphCache,
+        text: &str,
+        c: Caret,
+        dir: Vertical,
+        width: f32,
+    ) -> Caret {
+        let (projs, layout) = at(cache, text, c.offset, c.mode, width);
+        let got = vertical_target(&layout, &projs, text, c, dir, &space_width);
+        let (want, goal) = expected(text, &projs, &layout, c, dir);
+        let context = format!("{text:?} {c:?} {dir:?} width {width}");
+        match (got, want) {
+            (None, None) => c,
+            (Some((offset, kept)), Some(allowed)) => {
+                assert!(
+                    allowed.contains(&offset),
+                    "{context}: got {offset}, allowed {allowed:?}"
+                );
+                assert!(
+                    (kept - goal).abs() < 1e-4,
+                    "{context}: goal {kept} != {goal}"
+                );
+                assert!(
+                    crate::doc::is_valid_position(text, offset, c.mode),
+                    "{context}: {offset}"
+                );
+                // I-6 under the projection for the new cursor.
+                let after = projections_for(text, offset, c.mode);
+                assert!(
+                    crate::projection::check_frame_invariant(&after, offset, c.mode).is_ok(),
+                    "{context}: I-6 at {offset}"
+                );
+                Caret {
+                    offset,
+                    goal_x: Some(kept),
+                    ..c
+                }
+            }
+            (got, want) => panic!("{context}: got {got:?}, oracle {want:?}"),
+        }
+    }
+
+    #[test]
+    fn vertical_motion_matches_the_oracle_on_the_fixtures() {
+        for text in [
+            include_str!("../fixtures/spike.md"),
+            include_str!("../fixtures/no_trailing_newline.md"),
+        ] {
+            for width in [700.0, 220.0] {
+                let mut cache = ParagraphCache::default();
+                for mode in [Mode::Normal, Mode::Insert] {
+                    let positions = if mode == Mode::Insert {
+                        crate::doc::insert_bars(text)
+                    } else {
+                        crate::doc::normal_cursors(text)
+                    };
+                    // A spread of positions: the oracle is brute force, so not every one.
+                    for &o in positions.iter().step_by(positions.len() / 10 + 1) {
+                        for dir in [Up, Down] {
+                            for goal_x in [None, Some(0.0), Some(130.0), Some(5000.0)] {
+                                let c = Caret {
+                                    offset: o,
+                                    mode,
+                                    goal_x,
+                                };
+                                check_vertical(&mut cache, text, c, dir, width);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The geometry alphabet plus hyphenated words, which wrap with no swallowed whitespace,
+    /// and a longer paragraph-ish atom so rows wrap at the narrow widths.
+    fn vertical_atom() -> impl proptest::strategy::Strategy<Value = &'static str> {
+        proptest::prop_oneof![
+            4 => atom(),
+            1 => proptest::strategy::Just("-"),
+            1 => proptest::strategy::Just("ab-cd-ef-"),
+            1 => proptest::strategy::Just("\n\n"),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+
+        /// Walks of vertical moves on random documents agree with the brute-force oracle at
+        /// every step (row, landing cell or boundary, kept `goal_x`) and keep I-6.
+        #[test]
+        fn vertical_motion_matches_the_oracle_on_random_documents(
+            atoms in proptest::collection::vec(vertical_atom(), 0..30),
+            width in proptest::sample::select(vec![60.0f32, 150.0, 400.0]),
+            insert in proptest::prelude::any::<bool>(),
+            start in proptest::prelude::any::<proptest::sample::Index>(),
+            goal_x in proptest::option::of(0.0f32..300.0),
+            dirs in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..6),
+        ) {
+            let text = atoms.concat();
+            let mode = if insert { Mode::Insert } else { Mode::Normal };
+            let positions = if insert {
+                crate::doc::insert_bars(&text)
+            } else {
+                crate::doc::normal_cursors(&text)
+            };
+            let mut cache = ParagraphCache::default();
+            let mut c = Caret { offset: positions[start.index(positions.len())], mode, goal_x };
+            for down in dirs {
+                c = check_vertical(&mut cache, &text, c, if down { Down } else { Up }, width);
+            }
+        }
+    }
+
     // ---- the real widget, headless ---------------------------------------------------------
 
     #[test]
@@ -1575,6 +2471,73 @@ mod tests {
             tapped(&app, Key::Named(Named::F3)),
             [Message::Toggle(Toggle::F3)]
         );
+    }
+
+    #[test]
+    fn vertical_keys_reach_the_app_as_move_to() {
+        let text = "abc\n\ndef\n";
+        // Normal `j`: the gap row's EOL cell, with the cursor's column as `goal_x`.
+        let app = App::new(text.to_string());
+        assert_eq!(
+            tapped(&app, ch("j")),
+            [Message::MoveTo {
+                offset: 4,
+                goal_x: Some(0.0)
+            }]
+        );
+        // No row above: nothing is published, `goal_x` included.
+        assert_eq!(tapped(&app, ch("k")), []);
+        // Arrows are not Normal-mode motions, and `j` is not an Insert one.
+        assert_eq!(tapped(&app, Key::Named(Named::ArrowDown)), []);
+        let app = inserting(text);
+        assert_eq!(
+            tapped(&app, Key::Named(Named::ArrowDown)),
+            [Message::MoveTo {
+                offset: 4,
+                goal_x: Some(0.0)
+            }]
+        );
+        assert_eq!(tapped(&app, Key::Named(Named::ArrowUp)), []);
+        assert_eq!(tapped(&app, ch("j")), []);
+        assert_eq!(tapped(&app, ch("k")), []);
+    }
+
+    #[test]
+    fn vertical_keys_walk_the_whole_fixture_through_the_app_loop() {
+        // key -> widget -> MoveTo -> App::update -> view (per-frame I-6 assert), down to the
+        // last row and back up, in both modes. The column is kept all the way.
+        for insert in [false, true] {
+            let mut app = if insert {
+                inserting(SPIKE)
+            } else {
+                App::new(SPIKE.to_string())
+            };
+            let (down, up) = if insert {
+                (Key::Named(Named::ArrowDown), Key::Named(Named::ArrowUp))
+            } else {
+                (ch("j"), ch("k"))
+            };
+            for key in [down, up] {
+                let mut goals = vec![];
+                for _ in 0..12 {
+                    let messages = tapped(&app, key.clone());
+                    let [Message::MoveTo { offset, goal_x }] = messages.as_slice() else {
+                        break; // the first or last row: a no-op publishes nothing
+                    };
+                    goals.push(*goal_x);
+                    assert!(goal_x.is_some());
+                    app.update(messages[0]);
+                    let _ = app.view();
+                    assert!(*offset <= SPIKE.len());
+                }
+                assert!(
+                    goals.len() > 10,
+                    "the fixture has many rows: {}",
+                    goals.len()
+                );
+                assert!(goals.windows(2).all(|w| w[0] == w[1]), "{goals:?}");
+            }
+        }
     }
 
     /// The messages one left click at `point` produces.
