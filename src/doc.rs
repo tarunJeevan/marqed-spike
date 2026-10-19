@@ -5,6 +5,8 @@
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
+use crate::reveal::Mode;
+
 /// Start offset of every extended grapheme cluster in `text` (`\n` is its own grapheme).
 // I-1: offsets are source bytes on grapheme boundaries.
 pub fn grapheme_starts(text: &str) -> Vec<usize> {
@@ -35,6 +37,53 @@ pub fn prev_grapheme_boundary(text: &str, o: usize) -> Option<usize> {
         .prev_boundary(text, 0)
         .ok()
         .flatten()
+}
+
+/// Whether `o` is a grapheme boundary of `text` (`0` and `len` always are).
+// I-1
+pub fn is_grapheme_boundary(text: &str, o: usize) -> bool {
+    if o > text.len() || !text.is_char_boundary(o) {
+        return false;
+    }
+    GraphemeCursor::new(o, text.len(), true)
+        .is_boundary(text, 0)
+        .unwrap_or(false)
+}
+
+/// Whether `o` is a valid Normal cursor or Insert bar position (C-6).
+// I-1
+pub fn is_valid_position(text: &str, o: usize, mode: Mode) -> bool {
+    match mode {
+        Mode::Normal if text.is_empty() => o == 0,
+        Mode::Normal => o < text.len() && is_grapheme_boundary(text, o),
+        Mode::Insert => is_grapheme_boundary(text, o),
+    }
+}
+
+/// The largest grapheme boundary at or before `o` (`o` is clamped to the text).
+// I-1
+pub fn snap_to_grapheme_start(text: &str, o: usize) -> usize {
+    let mut o = o.min(text.len());
+    while !text.is_char_boundary(o) {
+        o -= 1;
+    }
+    if is_grapheme_boundary(text, o) {
+        o
+    } else {
+        prev_grapheme_boundary(text, o).unwrap_or(0)
+    }
+}
+
+/// Turns a raw offset (a click result, say) into a valid position for `mode`.
+// I-1
+pub fn normalize_position(text: &str, o: usize, mode: Mode) -> usize {
+    let o = snap_to_grapheme_start(text, o);
+    match mode {
+        Mode::Insert => o,
+        // A Normal cursor sits on a grapheme, so the end of the text is the last grapheme.
+        Mode::Normal if o >= text.len() => prev_grapheme_boundary(text, text.len()).unwrap_or(0),
+        Mode::Normal => o,
+    }
 }
 
 /// Every position a Normal cursor may take: a grapheme start in `[0, len)`, or `0` when empty (C-6).
@@ -116,6 +165,57 @@ mod tests {
         assert_eq!(prev_grapheme_boundary(text, 0), None);
         assert_eq!(next_grapheme_boundary("", 0), None);
         assert_eq!(prev_grapheme_boundary("", 0), None);
+    }
+
+    #[test]
+    fn position_validity_matches_the_cursor_lists() {
+        for text in ["", "abc", "é e\u{301}👍🏽\n", "\u{1F1FA}\u{1F1F8}x\n"] {
+            let normal = normal_cursors(text);
+            let insert = insert_bars(text);
+            for o in 0..=text.len() + 2 {
+                assert_eq!(
+                    is_valid_position(text, o, Mode::Normal),
+                    normal.contains(&o),
+                    "{text:?} normal {o}"
+                );
+                assert_eq!(
+                    is_valid_position(text, o, Mode::Insert),
+                    insert.contains(&o),
+                    "{text:?} insert {o}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapping_and_normalizing_always_give_valid_positions() {
+        for text in [
+            "",
+            "abc",
+            "é e\u{301}👍🏽\n",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}x\n",
+        ] {
+            for o in 0..=text.len() + 3 {
+                let snapped = snap_to_grapheme_start(text, o);
+                assert!(
+                    is_grapheme_boundary(text, snapped),
+                    "{text:?} {o} -> {snapped}"
+                );
+                assert!(snapped <= o.min(text.len()), "{text:?} {o} -> {snapped}");
+                for mode in [Mode::Normal, Mode::Insert] {
+                    let n = normalize_position(text, o, mode);
+                    assert!(
+                        is_valid_position(text, n, mode),
+                        "{text:?} {o} {mode:?} -> {n}"
+                    );
+                }
+            }
+        }
+        // Inside a cluster snaps to its start; the end of the text is the last grapheme for Normal.
+        assert_eq!(snap_to_grapheme_start("e\u{301}x", 1), 0);
+        assert_eq!(snap_to_grapheme_start("e\u{301}x", 2), 0);
+        assert_eq!(normalize_position("ab\n", 3, Mode::Normal), 2);
+        assert_eq!(normalize_position("ab\n", 3, Mode::Insert), 3);
     }
 
     #[test]
