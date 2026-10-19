@@ -21,6 +21,11 @@ pub fn one_line(base_size: f32) -> f32 {
     LineHeight::default().to_absolute(Pixels(base_size)).0
 }
 
+/// How far (in pixels) a column may sit left of a boundary and still count as at it. A
+/// sticky `goal_x` is usually exactly a cell's left edge, read from another row, and a cell's
+/// right edge (`x + width`) can differ from the next cell's `x` by rounding.
+pub const COLUMN_EPS: f32 = 0.01;
+
 /// One visual row: a layout run of the paragraph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -204,9 +209,12 @@ impl<'a> SegmentGeometry<'a> {
     /// The cell at `vis`: the grapheme's bounds, or an EOL cell of `space_width` at the end
     /// of a hard line (the cell of its `\n`, or the end of the segment).
     pub fn cell(&self, vis: usize, space_width: f32) -> Cell {
-        let rows = self.rows();
+        self.cell_in(&self.rows(), vis, space_width)
+    }
+
+    fn cell_in(&self, rows: &[Row], vis: usize, space_width: f32) -> Cell {
         let vis = vis.min(self.visible.len());
-        let at = self.locate_in(&rows, vis);
+        let at = self.locate_in(rows, vis);
         let at_line_end = vis >= self.visible.len() || self.visible.as_bytes()[vis] == b'\n';
         let width = if at_line_end {
             space_width
@@ -214,7 +222,7 @@ impl<'a> SegmentGeometry<'a> {
             let end = next_grapheme_boundary(self.visible, vis).unwrap_or(self.visible.len());
             // The right edge on this row; a grapheme at the end of a wrapped row stops there.
             let end = end.min(rows[at.row].vis_end);
-            let extent = (self.x_in_row(&rows, at.row, end) - at.x).max(0.0);
+            let extent = (self.x_in_row(rows, at.row, end) - at.x).max(0.0);
             // A grapheme with no glyph (whitespace swallowed at a soft wrap) has no extent
             // of its own: it hangs off the end of its row with the width of a space.
             if extent > f32::EPSILON {
@@ -230,6 +238,87 @@ impl<'a> SegmentGeometry<'a> {
             top: at.top,
             height: at.height,
         }
+    }
+
+    /// The grapheme starts a row owns, in order: the row's own graphemes, then (on the last
+    /// row of a hard line) `vis_end`, the end-of-line position.
+    fn row_boundaries(&self, row: &Row) -> Vec<usize> {
+        let mut at = Vec::new();
+        let mut vis = row.vis_start;
+        while vis < row.vis_end {
+            at.push(vis);
+            match next_grapheme_boundary(self.visible, vis) {
+                Some(next) if next > vis => vis = next,
+                _ => break,
+            }
+        }
+        if row.last_of_line {
+            at.push(row.vis_end);
+        }
+        at
+    }
+
+    /// Normal-mode landing on row `row` of the paragraph for a column `goal_x`: the grapheme
+    /// whose cell `[x, x + w)` contains it, else the nearest cell (the first on a tie), so a
+    /// point past the line end lands on the EOL cell. Returns its visible byte, which is
+    /// `visible.len()` for the segment's own EOL cell.
+    ///
+    /// A hard line's `\n` is always a cell; the end of the visible text is one only if
+    /// `eol_cell_at_end` (the segment has an EOL byte), otherwise the last grapheme is the
+    /// last cell. `None` when the row has no cell at all (an empty segment with no EOL byte).
+    pub fn pick_cell(
+        &self,
+        row: usize,
+        goal_x: f32,
+        space_width: f32,
+        eol_cell_at_end: bool,
+    ) -> Option<usize> {
+        let rows = self.rows();
+        let r = rows.get(row)?;
+        let goal_x = goal_x + COLUMN_EPS;
+        let mut best: Option<(f32, usize)> = None;
+        for vis in self.row_boundaries(r) {
+            if vis >= self.visible.len() && !eol_cell_at_end {
+                continue; // no EOL byte: the end of the text is not a cell
+            }
+            let cell = self.cell_in(&rows, vis, space_width);
+            if cell.x <= goal_x && goal_x < cell.x + cell.width {
+                return Some(vis);
+            }
+            let distance = if goal_x < cell.x {
+                cell.x - goal_x
+            } else {
+                goal_x - (cell.x + cell.width)
+            };
+            if best.is_none_or(|(d, _)| distance < d) {
+                best = Some((distance, vis));
+            }
+        }
+        best.map(|(_, vis)| vis)
+    }
+
+    /// Insert-mode landing on row `row` for a column `goal_x`: the boundary nearest to it
+    /// (the first on a tie, which also picks the first of several boundaries that share one
+    /// position, F-23). The `Hit` says whether `goal_x` is left of the boundary, which picks
+    /// the affinity across a concealed run exactly as a click does.
+    ///
+    /// A boundary at a soft wrap belongs to the row that starts there (F-26), so the end of a
+    /// wrapped row is reachable only through swallowed whitespace.
+    pub fn pick_boundary(&self, row: usize, goal_x: f32) -> Option<Hit> {
+        let rows = self.rows();
+        let r = rows.get(row)?;
+        let mut best: Option<(f32, usize, f32)> = None;
+        for vis in self.row_boundaries(r) {
+            let x = self.x_in_row(&rows, row, vis);
+            let distance = (goal_x - x).abs();
+            if best.is_none_or(|(d, _, _)| distance < d) {
+                best = Some((distance, vis, x));
+            }
+        }
+        best.map(|(_, vis, x)| Hit {
+            vis,
+            left_of_boundary: goal_x + COLUMN_EPS < x,
+        })
     }
 
     /// The visible boundary nearest `point` (relative to the paragraph's top-left).
@@ -694,6 +783,45 @@ mod tests {
             }
         }
         assert!(hanging > 0, "no width swallowed a single space at a wrap");
+    }
+
+    #[test]
+    fn pickers_choose_by_column_with_a_tolerance_at_cell_edges() {
+        let projs = projections("abcdef\n");
+        let p = &projs[0];
+        let paragraph = build_paragraph(p, 400.0);
+        let g = geometry_at(&paragraph, p);
+        let sw = 4.0;
+        let edge = g.cell(3, sw).x;
+        let inside = g.cell(2, sw);
+        assert!((inside.x + inside.width - edge).abs() < 0.01, "cells tile");
+        // A column inside a cell, and past the line end (the EOL cell).
+        assert_eq!(g.pick_cell(0, edge + 1.0, sw, true), Some(3));
+        assert_eq!(g.pick_cell(0, edge - 1.0, sw, true), Some(2));
+        assert_eq!(g.pick_cell(0, 1000.0, sw, true), Some(6));
+        assert_eq!(g.pick_cell(0, 1000.0, sw, false), Some(5));
+        assert_eq!(g.pick_cell(0, -5.0, sw, true), Some(0));
+        // Exactly on an edge, or within the tolerance left of it, belongs to the cell on the
+        // right; clearly left of it, to the one on the left.
+        assert_eq!(g.pick_cell(0, edge, sw, true), Some(3));
+        assert_eq!(g.pick_cell(0, edge - COLUMN_EPS / 2.0, sw, true), Some(3));
+        assert_eq!(g.pick_cell(0, edge - 2.0 * COLUMN_EPS, sw, true), Some(2));
+        // Boundaries: the nearest, and the affinity flips only beyond the tolerance.
+        let nearest = g.pick_boundary(0, edge + 0.1).expect("test: a boundary");
+        assert_eq!(nearest.vis, 3);
+        let on_it = g.pick_boundary(0, edge).expect("test: a boundary");
+        assert_eq!((on_it.vis, on_it.affinity()), (3, Affinity::After));
+        let within = g
+            .pick_boundary(0, edge - COLUMN_EPS / 2.0)
+            .expect("test: a boundary");
+        assert_eq!((within.vis, within.affinity()), (3, Affinity::After));
+        let left = g
+            .pick_boundary(0, edge - 2.0 * COLUMN_EPS)
+            .expect("test: a boundary");
+        assert_eq!((left.vis, left.affinity()), (3, Affinity::Before));
+        // A row that does not exist has no landing spot.
+        assert_eq!(g.pick_cell(7, 0.0, sw, true), None);
+        assert_eq!(g.pick_boundary(7, 0.0), None);
     }
 
     fn atom() -> impl Strategy<Value = &'static str> {
