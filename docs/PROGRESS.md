@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status
-Current task: T7 — done, awaiting developer review and sign-off; next: T8
+Current task: T7 — done (signed off by the developer 2026-10-19); next: T8
 Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
 
 ## Tasks
@@ -157,7 +157,7 @@ Last verification: 2026-10-18 — fmt ✓ clippy ✓ test ✓
   - Bug in my own new oracle, found by a random seed and fixed in the same task (not an earlier test): it shifted the goal by `COLUMN_EPS` when choosing the nearest Insert boundary, but C-8 says nearest to `goal_x`; the implementation was right (boundaries 3.326 and 3.339 px away, a 0.013 px near-tie). The seed was deleted with `proptest-regressions`.
   - My first `mutate.sh` mislabelled failing runs as "did not compile" (`grep '^error'` also matches `error: test failed`); rerun with a fixed check, results above are the rerun. All source files were restored from copies and compared after each run.
   - Process slip: I used a Python snippet to insert a throwaway `eprintln!` probe into `widget.rs` (to see why a long word did not wrap), then restored the file from a backup and removed the probe; no source edit of record was made that way. `HANDOFF.md` is still in the project root for you to delete after sign-off.
-- Sign-off: pending.
+- Sign-off: developer ran the T7 MANUAL checks on 2026-10-19 and confirmed: `j`/`k` (Normal) and `Down`/`Up` (Insert) move one row at a time; `k` on the first row and `j` on the last do nothing; the column is sticky and returns to the right column on going back; landing on a styled span always puts the cursor on visible text, never on a revealed marker; the keys are tied to their modes (arrows only in Insert, `j`/`k` only in Normal); F-29 holds in `fixtures/spike.md` (the trailing newline is reachable in Insert mode by horizontal movement but not by vertical movement); moving vertically onto a heading reveals its markers and keeps the styling; F1–F4 behave as before and F5 still changes nothing but the title. Committed by the developer (e415723) on the `task-7` branch.
 
 ## Findings
 - F-1 (T1): pulldown nests `***both***` as Emphasis (outer, index 0) containing Strong (inner, index 1); the six markers split as Emphasis `[0,1)`/`[9,10)` and Strong `[1,3)`/`[7,9)` — evidence: test `both_is_a_two_level_tree`.
