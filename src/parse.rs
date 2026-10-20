@@ -1,8 +1,5 @@
 //! Parse: source text to identity-free segments and constructs (C-2, C-3).
 
-// Consumed by later tasks (reveal, projection); remove once T2/T3 use every item.
-#![allow(dead_code)]
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
