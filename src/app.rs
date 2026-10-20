@@ -7,6 +7,7 @@ use iced::widget::scrollable;
 use ropey::Rope;
 
 use crate::doc::{is_valid_position, prev_grapheme_boundary, snap_to_grapheme_end};
+use crate::identity::{BlockId, Strategy as IdentityStrategy, assign};
 use crate::motion::{Direction, move_horizontal};
 use crate::parse::{ParseResult, parse};
 use crate::projection::{Projection, check_frame_invariant, project_all};
@@ -64,23 +65,13 @@ pub struct DebugFlags {
     pub click: bool,
 }
 
-/// The block-identity strategy F5 toggles (C-10). The strategies themselves arrive in T9.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityStrategy {
-    /// Position, then kind, then content hash.
-    L,
-    /// Content first.
-    C,
-}
-
-/// The timings of one edit's reparse loop (C-12). `identity` is `None` until the identity
-/// match exists (T9).
+/// The timings of one edit's reparse loop (C-12).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditPerf {
     pub version: u64,
     pub snapshot: Duration,
     pub parse: Duration,
-    pub identity: Option<Duration>,
+    pub identity: Duration,
     pub reveal_project: Duration,
     pub total: Duration,
 }
@@ -89,15 +80,12 @@ impl EditPerf {
     /// The one line written to stderr per edit, and shown in the overlay.
     pub fn line(&self) -> String {
         let ms = |d: Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
-        let identity = self
-            .identity
-            .map_or_else(|| "-".to_string(), |d| format!("{} ms", ms(d)));
         format!(
-            "edit v{}: snapshot {} ms, parse {} ms, identity {}, reveal+project {} ms, total {} ms",
+            "edit v{}: snapshot {} ms, parse {} ms, identity {} ms, reveal+project {} ms, total {} ms",
             self.version,
             ms(self.snapshot),
             ms(self.parse),
-            identity,
+            ms(self.identity),
             ms(self.reveal_project),
             ms(self.total),
         )
@@ -113,6 +101,11 @@ pub struct App {
     /// Bumped by every edit (C-9). I-8: a parse result is applied only if it carries this.
     version: u64,
     parsed: ParseResult,
+    /// C-10: one id per segment, parallel to `parsed.segments`. The ids live here, not in the
+    /// parse output; a strategy decides which new segment inherits which old id.
+    ids: Vec<BlockId>,
+    /// The monotonic counter fresh ids come from (C-10); an id is never reused.
+    next_id: u64,
     /// The latest edit's timings (C-12).
     perf: Option<EditPerf>,
     /// I-1: a source byte offset on a grapheme boundary. The Normal cursor, or the Insert bar.
@@ -122,6 +115,7 @@ pub struct App {
     mode: Mode,
     policy: RevealPolicy,
     flags: DebugFlags,
+    /// The strategy the next edit's identity match uses; F5 toggles it (C-10).
     identity: IdentityStrategy,
 }
 
@@ -129,11 +123,22 @@ impl App {
     pub fn new(source: String) -> Self {
         let version = 0;
         let parsed = parse(&source, version);
+        // With nothing before it, every segment gets a fresh id (either strategy).
+        let mut next_id = 0;
+        let ids = assign(
+            IdentityStrategy::L,
+            &[],
+            &[],
+            &parsed.segments,
+            &mut next_id,
+        );
         Self {
             rope: Rope::from_str(&source),
             source,
             version,
             parsed,
+            ids,
+            next_id,
             perf: None,
             cursor: 0,
             goal_x: None,
@@ -227,9 +232,12 @@ impl App {
         let result = parse(&snapshot, self.version);
         let parse_time = at.elapsed();
         // 4. Apply it only if it is current (I-8). The loop is synchronous, so it always is.
-        let applied = self.apply_parse(snapshot, result);
-        debug_assert!(applied, "I-8: a synchronous parse is never stale");
-        // 5. The identity match (C-10) arrives with T9.
+        // 5. The identity match (C-10) runs as part of applying it, against the previous ids.
+        let identity_time = self.apply_parse(snapshot, result);
+        debug_assert!(
+            identity_time.is_some(),
+            "I-8: a synchronous parse is never stale"
+        );
 
         // Typed text can merge with its neighbours into one grapheme cluster (a combining mark
         // typed before another, say), so the literal `bar + text.len()` can fall inside a
@@ -246,7 +254,7 @@ impl App {
             version: self.version,
             snapshot: snapshot_time,
             parse: parse_time,
-            identity: None,
+            identity: identity_time.unwrap_or_default(),
             reveal_project,
             total: began.elapsed(),
         };
@@ -255,15 +263,26 @@ impl App {
     }
 
     /// Applies a parse result computed from `snapshot` only if it carries the current
-    /// version; a stale one is discarded and nothing changes. Returns whether it was applied.
+    /// version; a stale one is discarded and nothing changes (`None`). Applying runs the
+    /// identity match (C-10) of the new segments against the old ones and returns how long it
+    /// took.
     // I-8
-    fn apply_parse(&mut self, snapshot: String, result: ParseResult) -> bool {
+    fn apply_parse(&mut self, snapshot: String, result: ParseResult) -> Option<Duration> {
         if result.version != self.version {
-            return false;
+            return None;
         }
+        let at = Instant::now();
+        self.ids = assign(
+            self.identity,
+            &self.parsed.segments,
+            &self.ids,
+            &result.segments,
+            &mut self.next_id,
+        );
+        let identity_time = at.elapsed();
         self.source = snapshot;
         self.parsed = result;
-        true
+        Some(identity_time)
     }
 
     /// Every horizontal motion clears `goal_x` (C-7).
@@ -329,6 +348,11 @@ impl App {
             check_frame_invariant(&projections, self.cursor, self.mode).is_ok(),
             "I-6: cursor concealed under its own projection"
         );
+        debug_assert_eq!(
+            self.ids.len(),
+            self.parsed.segments.len(),
+            "C-10: one id per segment"
+        );
         let kinds = self.parsed.segments.iter().map(|s| s.kind).collect();
         scrollable(
             DocumentView::new(
@@ -340,6 +364,7 @@ impl App {
                 self.goal_x,
                 self.flags,
             )
+            .ids(self.ids.clone())
             .perf(self.perf.map(|p| p.line())),
         )
         .into()
@@ -1024,7 +1049,7 @@ mod tests {
         // Computed from an older version, and from a version that does not exist yet.
         for version in [0, 1, 3, u64::MAX] {
             let applied = a.apply_parse("zzz\n\nzzz\n".to_string(), parse("zzz\n\nzzz\n", version));
-            assert!(!applied, "version {version} is not current");
+            assert!(applied.is_none(), "version {version} is not current");
             assert_eq!(
                 (a.source.as_str(), &a.parsed),
                 ("abcd\n", &before),
@@ -1033,7 +1058,7 @@ mod tests {
         }
         // The current one applies.
         let fresh = parse("abcd\n", 2);
-        assert!(a.apply_parse("abcd\n".to_string(), fresh.clone()));
+        assert!(a.apply_parse("abcd\n".to_string(), fresh.clone()).is_some());
         assert_eq!(a.parsed, fresh);
     }
 
@@ -1062,15 +1087,13 @@ mod tests {
         type_text(&mut a, "x");
         let perf = a.perf.expect("test: an edit records its timing");
         assert_eq!(perf.version, 1);
-        // The identity match arrives in T9.
-        assert_eq!(perf.identity, None);
-        assert!(perf.total >= perf.snapshot + perf.parse + perf.reveal_project);
+        assert!(perf.total >= perf.snapshot + perf.parse + perf.identity + perf.reveal_project);
         let line = perf.line();
         for part in [
             "edit v1:",
             "snapshot",
             "parse",
-            "identity -",
+            "identity",
             "reveal+project",
             "total",
         ] {
@@ -1084,7 +1107,7 @@ mod tests {
             version: 7,
             snapshot: Duration::from_micros(1500),
             parse: Duration::from_micros(250),
-            identity: Some(Duration::from_micros(3)),
+            identity: Duration::from_micros(3),
             reveal_project: Duration::from_millis(2),
             total: Duration::from_micros(4000),
         };
@@ -1194,6 +1217,8 @@ mod tests {
         Left,
         Right,
         EscThenI,
+        /// F5: the next edit's identity match uses the other strategy.
+        SwitchIdentity,
     }
 
     fn key() -> impl Strategy<Value = Key> {
@@ -1207,6 +1232,7 @@ mod tests {
             2 => Just(Key::Left),
             2 => Just(Key::Right),
             1 => Just(Key::EscThenI),
+            1 => Just(Key::SwitchIdentity),
         ]
     }
 
@@ -1216,7 +1242,9 @@ mod tests {
         /// Random Insert sessions: the rope, the snapshot and a plain `String` model agree after
         /// every key; the parse is the parse of that text at the current version; the version
         /// counts effective edits; the bar is a valid position and the per-frame I-6 assert (in
-        /// `view`) never fires, under all four policies.
+        /// `view`) never fires, under all four policies. The ids stay one per segment and
+        /// unique, and an id that has left the document never comes back (C-10), whichever
+        /// strategy F5 has selected at each edit.
         #[test]
         fn insert_sessions_match_a_string_model(
             atoms in prop::collection::vec(
@@ -1234,6 +1262,8 @@ mod tests {
             let bar = bars[start.index(bars.len())];
             let mut a = inserting(&text, bar, policy);
             let mut model = Model { text: text.clone(), bar, edits: 0 };
+            let mut previous: std::collections::HashSet<_> = a.ids.iter().copied().collect();
+            let mut retired = std::collections::HashSet::new();
             for k in keys {
                 let moved = match k {
                     Key::Type(t) => { type_text(&mut a, t); model.insert(t); false }
@@ -1242,6 +1272,7 @@ mod tests {
                     Key::Left => { a.update(MoveLeft); true }
                     Key::Right => { a.update(MoveRight); true }
                     Key::EscThenI => { a.update(ExitInsert); a.update(EnterInsert); true }
+                    Key::SwitchIdentity => { a.update(Message::Toggle(Toggle::F5)); false }
                 };
                 let _ = a.view();
                 if moved {
@@ -1255,8 +1286,150 @@ mod tests {
                 prop_assert!(is_valid_position(&a.source, a.cursor, Mode::Insert), "{}", at);
                 prop_assert_eq!(a.version, model.edits, "{}", at);
                 prop_assert_eq!(&a.parsed, &parse(&a.source, a.version), "{}", at);
+
+                prop_assert_eq!(a.ids.len(), a.parsed.segments.len(), "{}", at);
+                let current: std::collections::HashSet<_> = a.ids.iter().copied().collect();
+                prop_assert_eq!(current.len(), a.ids.len(), "ids are unique: {}", at);
+                prop_assert!(a.ids.iter().all(|id| id.0 < a.next_id), "{}", at);
+                prop_assert!(current.is_disjoint(&retired), "a retired id came back: {}", at);
+                retired.extend(previous.difference(&current).copied());
+                previous = current;
             }
         }
+    }
+
+    // ---- block identity in the app (C-10) --------------------------------------------------------
+
+    /// The ids of the non-Gap segments, in document order.
+    fn block_ids(a: &App) -> Vec<BlockId> {
+        a.parsed
+            .segments
+            .iter()
+            .zip(&a.ids)
+            .filter(|(s, _)| s.kind != SegmentKind::Gap)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    #[test]
+    fn ids_start_fresh_and_in_order_and_follow_a_typed_edit() {
+        let mut a = inserting("alpha\n\nbeta\n", 7, POLICIES[0]);
+        assert_eq!(a.ids, [BlockId(0), BlockId(1), BlockId(2)]);
+        assert_eq!(a.next_id, 3);
+        // A character typed into `beta`: every id stays (either strategy), the counter too.
+        type_text(&mut a, "x");
+        assert_eq!(a.ids, [BlockId(0), BlockId(1), BlockId(2)]);
+        assert_eq!(a.next_id, 3);
+        // An empty document has no ids, and the first typed character gets one.
+        let mut a = inserting("", 0, POLICIES[0]);
+        assert!(a.ids.is_empty());
+        type_text(&mut a, "a");
+        assert_eq!(a.ids, [BlockId(0)]);
+    }
+
+    #[test]
+    fn f5_switches_the_strategy_the_next_edit_uses() {
+        // A twenty-byte insert into `body` shifts `tail` by more than its own length, so it no
+        // longer overlaps its old range: position-first matching loses its id, content-first
+        // keeps it (case 4 of the identity matrix, seen through the app).
+        let text = "head\n\nbody\n\ntail\n";
+        let typed = "twenty bytes of text!";
+        assert_eq!(typed.len(), 21);
+        for (f5_presses, tail_keeps) in [(0, false), (1, true), (2, false)] {
+            let mut a = inserting(text, 6, POLICIES[0]);
+            for _ in 0..f5_presses {
+                a.update(Message::Toggle(Toggle::F5));
+            }
+            let before = block_ids(&a);
+            type_text(&mut a, typed);
+            let after = block_ids(&a);
+            assert_eq!(after.len(), 3);
+            assert_eq!(
+                (after[0], after[1]),
+                (before[0], before[1]),
+                "{f5_presses} presses"
+            );
+            assert_eq!(
+                after[2] == before[2],
+                tail_keeps,
+                "{f5_presses} presses: {after:?}"
+            );
+        }
+        // Toggling alone changes no ids: the strategy applies at the next edit.
+        let mut a = inserting(text, 6, POLICIES[0]);
+        let before = a.ids.clone();
+        a.update(Message::Toggle(Toggle::F5));
+        assert_eq!(a.ids, before);
+    }
+
+    #[test]
+    fn a_one_byte_edit_renumbers_the_gaps_below_it_under_l_only() {
+        // A character typed in `head` shifts everything after it by one byte. The blocks are
+        // longer than that, so their new ranges still overlap their old ones (both strategies
+        // keep them); each Gap is one byte, so its shifted range only touches the old one and L
+        // gives it a fresh id, while C keeps it. The matrix does not constrain Gap ids, so this
+        // is the effect a developer sees in the overlay (F-47).
+        let text = "head\n\nbody\n\ntail\n";
+        for (f5_presses, gaps_keep) in [(0, false), (1, true)] {
+            let mut a = inserting(text, 0, POLICIES[0]);
+            for _ in 0..f5_presses {
+                a.update(Message::Toggle(Toggle::F5));
+            }
+            let before = a.ids.clone();
+            assert_eq!(before.len(), 5);
+            type_text(&mut a, "x");
+            // Segments: head, gap, body, gap, tail.
+            for block in [0, 2, 4] {
+                assert_eq!(
+                    a.ids[block], before[block],
+                    "{f5_presses} presses: block {block}"
+                );
+            }
+            for gap in [1, 3] {
+                assert_eq!(
+                    a.ids[gap] == before[gap],
+                    gaps_keep,
+                    "{f5_presses} presses: gap {gap}: {:?}",
+                    a.ids
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enter_twice_mid_paragraph_keeps_the_first_half_and_gives_the_second_a_fresh_id_under_c() {
+        let mut a = inserting("head\n\nonetwo\n\ntail\n", 9, POLICIES[0]);
+        a.update(Message::Toggle(Toggle::F5)); // L -> C
+        let before = block_ids(&a);
+        a.update(Message::Newline);
+        a.update(Message::Newline);
+        let after = block_ids(&a);
+        assert_eq!(after.len(), 4);
+        assert_eq!(
+            (after[0], after[1], after[3]),
+            (before[0], before[1], before[2])
+        );
+        assert!(
+            !before.contains(&after[2]),
+            "the second half is fresh: {after:?}"
+        );
+        // Backspacing the blank line joins them again: the first half's id survives, the second
+        // half's is retired.
+        a.update(Message::Backspace);
+        a.update(Message::Backspace);
+        let joined = block_ids(&a);
+        assert_eq!(joined, before);
+    }
+
+    #[test]
+    fn a_stale_parse_leaves_the_ids_and_the_counter_alone() {
+        let mut a = inserting("ab\n\ncd\n", 1, POLICIES[0]);
+        type_text(&mut a, "x");
+        let (ids, next) = (a.ids.clone(), a.next_id);
+        let applied = a.apply_parse("zz\n\nzz\n\nzz\n".to_string(), parse("zz\n\nzz\n\nzz\n", 0));
+        assert!(applied.is_none());
+        assert_eq!((&a.ids, a.next_id), (&ids, next));
+        assert_eq!(a.ids.len(), a.parsed.segments.len());
     }
 
     #[test]
