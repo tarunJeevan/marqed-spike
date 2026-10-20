@@ -132,10 +132,10 @@ Evidence to compare against, per step: step 1 F-13, F-14, F-15, F-17; step 2 F-6
 
 ## Developer verdict (developer fills in)
 
-- Go / no-go:
-- Heading granularity (G1/G2):
-- Nesting (N1/N2):
-- Identity strategy:
+- Go / no-go: I think it's a go. The projection spike reveals the Marktext-style conceal/reveal rendering model is feasible (though parsing will need to be optimized to prevent lag on large documents).
+- Heading granularity (G1/G2): G1 is the better option. G2 requires either extra motions to be able to reveal and land on the markers or to blindly delete via Backspace in Insert mode. 
+- Nesting (N1/N2): N2 is the better option. Revealing both outer and inner markers makes it clear what I'm editing. 
+- Identity strategy: There was no detectable difference in performance during usage, but strategy C (content-first) seems cleaner and more reliable at scale. 
 
 ## Draft decision-log entries (for developer approval)
 
