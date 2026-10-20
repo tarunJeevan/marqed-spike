@@ -151,10 +151,25 @@ impl App {
 
     /// Projections for the current cursor, mode and policies: recomputed on demand, never
     /// stored (C-1).
-    fn projections(&self) -> Vec<Projection> {
+    pub(crate) fn projections(&self) -> Vec<Projection> {
         let segments = &self.parsed.segments;
         let set = reveal(segments, self.cursor, self.mode, self.policy);
         project_all(&self.source, segments, &set)
+    }
+
+    /// The snapshot of the text the current parse was computed from.
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// How many segments the current parse has.
+    pub(crate) fn segment_count(&self) -> usize {
+        self.parsed.segments.len()
+    }
+
+    /// The timings of the latest edit, if there has been one (C-12).
+    pub(crate) fn last_perf(&self) -> Option<EditPerf> {
+        self.perf
     }
 
     pub fn update(&mut self, message: Message) {
@@ -1296,6 +1311,21 @@ mod tests {
                 previous = current;
             }
         }
+    }
+
+    // ---- the iced_test smoke test (T10) ---------------------------------------------------------
+
+    #[test]
+    fn iced_test_simulator_drives_the_custom_widget() {
+        // Builds the App's real view (the custom `DocumentView` inside a `scrollable`), draws it
+        // through the real renderer, sends `tap_key` for `l` and reads the message it published.
+        let a = app(&fixture("spike.md"));
+        let mut ui = iced_test::simulator(a.view());
+        ui.snapshot(&iced::Theme::Light)
+            .expect("test: the real renderer draws the view");
+        ui.tap_key(iced::keyboard::Key::Character("l".into()));
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert_eq!(messages, [Message::MoveRight]);
     }
 
     // ---- block identity in the app (C-10) --------------------------------------------------------
