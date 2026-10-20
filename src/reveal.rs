@@ -1,8 +1,5 @@
 //! Reveal: which constructs show their markers for a cursor (C-4).
 
-// Consumed by later tasks (projection, widget); remove once T3+ use every item.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use crate::parse::{Construct, ConstructKind, Segment};
@@ -63,6 +60,7 @@ impl RevealSet {
         }
     }
 
+    #[cfg(test)]
     pub fn is_revealed(&self, segment: usize, construct: usize) -> bool {
         self.for_segment(segment)
             .get(construct)
@@ -75,6 +73,7 @@ impl RevealSet {
         self.per_segment.get(segment).map_or(&[], Vec::as_slice)
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.per_segment
             .iter()

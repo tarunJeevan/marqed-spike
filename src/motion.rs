@@ -1,8 +1,5 @@
 //! Horizontal motions (C-7): pure functions resolved against the projection for the current cursor.
 
-// Consumed by later tasks (app update, widget keys); remove once they use every item.
-#![allow(dead_code)]
-
 use crate::doc::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::projection::{Projection, Run};
 use crate::reveal::Mode;

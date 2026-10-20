@@ -91,7 +91,6 @@ The G2 Insert rule is there because `##` on its own is a valid empty ATX heading
   - If no concealed run sits between `v`'s neighbours, the result is unique.
   - Otherwise, `Before` gives the offset immediately after the preceding visible byte, and `After` gives the offset of the following visible byte.
   - At `v == visible_len`: `Before` gives the offset after the last visible byte; `After` gives the EOL byte offset, or `seg.end` if there is no EOL byte.
-- **`VisualPos`** is `(segment index, visible byte, affinity)`. Pixels are derived from it on demand (C-8).
 
 ## C-6 Cursor model, frame invariant, newline rule
  
