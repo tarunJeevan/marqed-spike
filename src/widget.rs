@@ -23,6 +23,7 @@ use iced::{
 use crate::app::{DebugFlags, Message, Toggle};
 use crate::doc::{normalize_position, prev_grapheme_boundary};
 use crate::geometry::{SegmentGeometry, one_line};
+use crate::identity::BlockId;
 use crate::parse::SegmentKind;
 use crate::projection::{Affinity, BASE_SIZE, Projection, Run, Style};
 use crate::reveal::Mode;
@@ -650,9 +651,17 @@ pub struct DocumentView<'a> {
     flags: DebugFlags,
     /// The latest edit's timing line, shown in the overlay (C-12).
     perf: Option<String>,
+    /// One id per segment, shown in the overlay (C-10, C-11); empty if none are known.
+    ids: Vec<BlockId>,
 }
 
 impl<'a> DocumentView<'a> {
+    /// Sets the segment ids the F3 overlay labels each segment with.
+    pub fn ids(mut self, ids: Vec<BlockId>) -> Self {
+        self.ids = ids;
+        self
+    }
+
     /// Sets the timing line the F3 overlay shows.
     pub fn perf(mut self, line: Option<String>) -> Self {
         self.perf = line;
@@ -677,6 +686,7 @@ impl<'a> DocumentView<'a> {
             goal_x,
             flags,
             perf: None,
+            ids: Vec::new(),
         }
     }
 }
@@ -894,7 +904,7 @@ impl DocumentView<'_> {
         drawn: Range<usize>,
     ) {
         let outline = Color::from_rgba(0.1, 0.4, 0.9, 0.55);
-        let label = Color::from_rgba(0.1, 0.3, 0.8, 0.95);
+        let label = Color::from_rgba(0.1, 0.8, 0.3, 0.95);
         let tick = Color::from_rgba(0.9, 0.1, 0.1, 0.8);
         let stats = state.layout.stats;
         let mut summary = format!(
@@ -933,9 +943,13 @@ impl DocumentView<'_> {
                     .get(i)
                     .copied()
                     .map_or_else(|| "?".to_string(), kind_label);
-                let label_size = Size::new(120.0, 12.0);
+                let label_size = Size::new(170.0, 12.0);
+                let label_text = match self.ids.get(i) {
+                    Some(id) => format!("{i}: {kind} #{}", id.0),
+                    None => format!("{i}: {kind}"),
+                };
                 renderer.fill_text(
-                    overlay_text(format!("{i}: {kind}"), label_size, Alignment::Right),
+                    overlay_text(label_text, label_size, Alignment::Right),
                     Point::new(rect.x + rect.width - label_size.width - 2.0, rect.y + 1.0),
                     label,
                     *viewport,
