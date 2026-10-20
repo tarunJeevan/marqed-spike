@@ -1,8 +1,5 @@
 //! Projection: a segment's visible text, styles and source↔visible mapping (C-5, C-6).
 
-// Consumed by later tasks (motion, geometry, widget); remove once they use every item.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use crate::parse::{ConstructKind, Segment, SegmentKind};
@@ -64,14 +61,6 @@ impl Run {
 pub enum Affinity {
     Before,
     After,
-}
-
-/// `(segment index, visible byte, affinity)`. Pixels are derived from it on demand (C-8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VisualPos {
-    pub segment: usize,
-    pub vis: usize,
-    pub affinity: Affinity,
 }
 
 /// Result of `src_to_vis`: a visible byte offset, flagged when the source byte is the EOL byte.

@@ -1,14 +1,14 @@
 //! Document-level helpers over the per-parse `String` snapshot (C-1).
 
-// Consumed by later tasks (motion, geometry); remove once they use every item.
-#![allow(dead_code)]
-
-use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
+use unicode_segmentation::GraphemeCursor;
+#[cfg(test)]
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::reveal::Mode;
 
 /// Start offset of every extended grapheme cluster in `text` (`\n` is its own grapheme).
 // I-1: offsets are source bytes on grapheme boundaries.
+#[cfg(test)]
 pub fn grapheme_starts(text: &str) -> Vec<usize> {
     text.grapheme_indices(true).map(|(i, _)| i).collect()
 }
@@ -101,6 +101,7 @@ pub fn normalize_position(text: &str, o: usize, mode: Mode) -> usize {
 }
 
 /// Every position a Normal cursor may take: a grapheme start in `[0, len)`, or `0` when empty (C-6).
+#[cfg(test)]
 pub fn normal_cursors(text: &str) -> Vec<usize> {
     let mut starts = grapheme_starts(text);
     if starts.is_empty() {
@@ -110,6 +111,7 @@ pub fn normal_cursors(text: &str) -> Vec<usize> {
 }
 
 /// Every position an Insert bar may take: a grapheme boundary in `[0, len]` (C-6).
+#[cfg(test)]
 pub fn insert_bars(text: &str) -> Vec<usize> {
     let mut bars = grapheme_starts(text);
     bars.push(text.len());

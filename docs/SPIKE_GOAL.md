@@ -142,7 +142,7 @@ cargo run -- fixtures/spike.md        # manual checks are the developer's (§8)
 ## Draft decision-log entries (for developer approval)
 
 <one draft per item: spike verdict; nested reveal; heading granularity; identity heuristic
- (incl. identity as optimization hint?); Block has no id — ids held by ui; VisualPos + snapping contract;
+ (incl. identity as optimization hint?); Block has no id — ids held by ui; snapping contract;
  vertical motion as a ui geometry query with transient goal_x>
 ```
 
