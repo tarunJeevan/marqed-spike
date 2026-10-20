@@ -1,6 +1,7 @@
 //! Throwaway marqed projection spike - single binary for testing block-identity heuristic and other unresolved architectural decisions
 
 mod app;
+mod bench;
 mod doc;
 mod geometry;
 mod identity;
@@ -82,9 +83,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if args.bench.is_some() {
-        // Headless bench mode lands in T10 (C-12).
-        eprintln!("note: --bench is not implemented yet; opening the window instead");
+    if let Some(k) = args.bench {
+        // Headless bench mode (C-12): the full pipeline without a window, then exit.
+        let title = format!("{} --repeat {}", args.path.display(), args.repeat);
+        print!("{}", bench::format(&title, &bench::run(&source, k)));
+        return ExitCode::SUCCESS;
     }
 
     let result = iced::application(move || App::new(source.clone()), App::update, App::view)
