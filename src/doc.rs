@@ -74,6 +74,20 @@ pub fn snap_to_grapheme_start(text: &str, o: usize) -> usize {
     }
 }
 
+/// The smallest grapheme boundary at or after `o` (`o` is clamped to the text): the end of the
+/// cluster containing `o` if `o` is inside one. An edit uses this for the bar, since typed text
+/// can merge with its neighbours into one cluster (a combining mark, a regional indicator).
+// I-1
+pub fn snap_to_grapheme_end(text: &str, o: usize) -> usize {
+    let o = o.min(text.len());
+    let start = snap_to_grapheme_start(text, o);
+    if start == o {
+        o
+    } else {
+        next_grapheme_boundary(text, start).unwrap_or(text.len())
+    }
+}
+
 /// Turns a raw offset (a click result, say) into a valid position for `mode`.
 // I-1
 pub fn normalize_position(text: &str, o: usize, mode: Mode) -> usize {
@@ -216,6 +230,35 @@ mod tests {
         assert_eq!(snap_to_grapheme_start("e\u{301}x", 2), 0);
         assert_eq!(normalize_position("ab\n", 3, Mode::Normal), 2);
         assert_eq!(normalize_position("ab\n", 3, Mode::Insert), 3);
+    }
+
+    #[test]
+    fn snapping_forward_gives_the_end_of_the_cluster() {
+        // Inside a cluster: its end. On a boundary, or past the end: unchanged / clamped.
+        assert_eq!(snap_to_grapheme_end("e\u{301}x", 1), 3);
+        assert_eq!(snap_to_grapheme_end("e\u{301}x", 3), 3);
+        assert_eq!(snap_to_grapheme_end("e\u{301}x", 0), 0);
+        assert_eq!(snap_to_grapheme_end("e\u{301}x", 99), 4);
+        // A flag is a pair of regional indicators; between them is the middle of the cluster.
+        assert_eq!(snap_to_grapheme_end("\u{1F1FA}\u{1F1F8}x", 4), 8);
+        assert_eq!(snap_to_grapheme_end("", 0), 0);
+        for text in [
+            "",
+            "abc",
+            "é e\u{301}👍🏽\n",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}x\n",
+        ] {
+            for o in 0..=text.len() + 3 {
+                let end = snap_to_grapheme_end(text, o);
+                assert!(is_grapheme_boundary(text, end), "{text:?} {o} -> {end}");
+                assert!(end >= o.min(text.len()), "{text:?} {o} -> {end}");
+                // Nothing nearer: the previous grapheme boundary is below `o`.
+                if end > 0 && o <= text.len() {
+                    let before = prev_grapheme_boundary(text, end).unwrap_or(0);
+                    assert!(before < o || end == o, "{text:?} {o} -> {end}");
+                }
+            }
+        }
     }
 
     #[test]

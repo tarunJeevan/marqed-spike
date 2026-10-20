@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::{DefaultHasher, Entry};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use iced::advanced::graphics::text::Paragraph as TextParagraph;
 use iced::advanced::layout::{self, Layout};
@@ -430,6 +431,32 @@ pub fn vertical_key(
     }
 }
 
+/// What a key means as an edit (C-9), in Insert mode only: Backspace, Enter, and typed text.
+///
+/// Typed text is a key press whose `text` is non-empty, has no control character and comes with
+/// no ctrl/alt/logo modifier (shift is part of the text). Everything else is `None`: Escape, Tab,
+/// Delete and the rest carry control characters or no text.
+pub fn edit_message(
+    mode: Mode,
+    key: &keyboard::Key,
+    text: Option<&str>,
+    modifiers: keyboard::Modifiers,
+) -> Option<Message> {
+    use keyboard::Key;
+    use keyboard::key::Named;
+
+    if mode != Mode::Insert || modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::Backspace) => Some(Message::Backspace),
+        Key::Named(Named::Enter) => Some(Message::Newline),
+        _ => text
+            .filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+            .map(|t| Message::InsertText(t.to_string())),
+    }
+}
+
 /// Where a vertical motion starts: the stored cursor state it reads (C-1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Caret {
@@ -599,6 +626,8 @@ struct State {
     layout: DocumentLayout,
     /// Space advance per base size (keyed by the size's bits), for EOL cells.
     space_widths: HashMap<u32, f32>,
+    /// How long the last layout pass took (C-12), for the overlay.
+    layout_time: Duration,
 }
 
 impl State {
@@ -619,9 +648,17 @@ pub struct DocumentView<'a> {
     mode: Mode,
     goal_x: Option<f32>,
     flags: DebugFlags,
+    /// The latest edit's timing line, shown in the overlay (C-12).
+    perf: Option<String>,
 }
 
 impl<'a> DocumentView<'a> {
+    /// Sets the timing line the F3 overlay shows.
+    pub fn perf(mut self, line: Option<String>) -> Self {
+        self.perf = line;
+        self
+    }
+
     pub fn new(
         source: &'a str,
         projections: Vec<Projection>,
@@ -639,6 +676,7 @@ impl<'a> DocumentView<'a> {
             mode,
             goal_x,
             flags,
+            perf: None,
         }
     }
 }
@@ -690,7 +728,9 @@ impl Widget<Message, Theme, iced::Renderer> for DocumentView<'_> {
             w if w.is_finite() => w,
             _ => FALLBACK_WIDTH,
         };
+        let began = Instant::now();
         state.layout = layout_document(&mut state.cache, &self.projections, width);
+        state.layout_time = began.elapsed();
         for p in &self.projections {
             state
                 .space_widths
@@ -720,6 +760,7 @@ impl Widget<Message, Theme, iced::Renderer> for DocumentView<'_> {
             Event::Keyboard(keyboard::Event::KeyPressed {
                 modified_key,
                 modifiers,
+                text,
                 ..
             }) => {
                 if let Some(message) = key_message(self.mode, modified_key, *modifiers) {
@@ -748,6 +789,11 @@ impl Widget<Message, Theme, iced::Renderer> for DocumentView<'_> {
                             goal_x: Some(goal_x),
                         });
                     }
+                    shell.capture_event();
+                } else if let Some(message) =
+                    edit_message(self.mode, modified_key, text.as_deref(), *modifiers)
+                {
+                    shell.publish(message);
                     shell.capture_event();
                 }
             }
@@ -851,14 +897,16 @@ impl DocumentView<'_> {
         let label = Color::from_rgba(0.1, 0.3, 0.8, 0.95);
         let tick = Color::from_rgba(0.9, 0.1, 0.1, 0.8);
         let stats = state.layout.stats;
-        let summary = format!(
-            "cache hits {}  misses {}  entries {}\nsegments {}  drawn {}",
+        let mut summary = format!(
+            "cache hits {}  misses {}  entries {}  layout {:.3} ms\nsegments {}  drawn {}\n",
             stats.hits,
             stats.misses,
             state.cache.len(),
+            state.layout_time.as_secs_f64() * 1000.0,
             state.layout.segments.len(),
             drawn.len(),
         );
+        summary.push_str(self.perf.as_deref().unwrap_or("no edits yet"));
 
         // A separate layer, so the quads sit above the paragraph text.
         renderer.with_layer(*viewport, |renderer| {
@@ -919,7 +967,7 @@ impl DocumentView<'_> {
 
             let panel = Rectangle::new(
                 Point::new(viewport.x + 4.0, viewport.y + 4.0),
-                Size::new(240.0, 34.0),
+                Size::new(540.0, 46.0),
             );
             renderer.fill_quad(
                 Quad {
@@ -929,7 +977,7 @@ impl DocumentView<'_> {
                 Color::from_rgba(0.0, 0.0, 0.0, 0.75),
             );
             renderer.fill_text(
-                overlay_text(summary, Size::new(232.0, 28.0), Alignment::Left),
+                overlay_text(summary, Size::new(532.0, 40.0), Alignment::Left),
                 Point::new(panel.x + 4.0, panel.y + 3.0),
                 Color::WHITE,
                 *viewport,
@@ -1270,7 +1318,7 @@ mod tests {
             msg(Mode::Insert, &Key::Named(Named::ArrowRight)),
             Some(Message::MoveRight)
         );
-        // Typed text is ignored until T8: no `h`/`l`/`i` motions in Insert mode.
+        // No `h`/`l`/`i` motions in Insert mode (typed text is `edit_message`'s, not this table's).
         for key in [
             ch("h"),
             ch("l"),
@@ -1714,6 +1762,91 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ---- editing keys ---------------------------------------------------------------------------
+
+    #[test]
+    fn edit_keys_by_text_mode_and_modifiers() {
+        let none = keyboard::Modifiers::empty();
+        let typed = |t: &str| Some(Message::InsertText(t.to_string()));
+        let backspace = Key::Named(Named::Backspace);
+        let enter = Key::Named(Named::Enter);
+        for (key, text, want) in [
+            // Typed text, shift included (it is part of the text), and multi-character commits.
+            (ch("a"), Some("a"), typed("a")),
+            (ch("A"), Some("A"), typed("A")),
+            (Key::Named(Named::Space), Some(" "), typed(" ")),
+            (ch("é"), Some("é"), typed("é")),
+            (ch("e"), Some("e\u{301}"), typed("e\u{301}")),
+            (ch(":"), Some(":"), typed(":")),
+            (ch("l"), Some("l"), typed("l")),
+            // No text, empty text, or a control character in it: ignored.
+            (ch("a"), None, None),
+            (ch("a"), Some(""), None),
+            (ch("a"), Some("a\n"), None),
+            (ch("a"), Some("\u{0}"), None),
+            (Key::Named(Named::Tab), Some("\t"), None),
+            (Key::Named(Named::Delete), Some("\u{7f}"), None),
+            (Key::Named(Named::Escape), Some("\u{1b}"), None),
+            // Backspace and Enter, whatever text the platform attaches.
+            (backspace.clone(), Some("\u{8}"), Some(Message::Backspace)),
+            (backspace.clone(), None, Some(Message::Backspace)),
+            (enter.clone(), Some("\r"), Some(Message::Newline)),
+            (enter.clone(), None, Some(Message::Newline)),
+        ] {
+            assert_eq!(
+                edit_message(Mode::Insert, &key, text, none),
+                want,
+                "{key:?} {text:?}"
+            );
+        }
+        // Shift is allowed; ctrl, alt and logo make it a shortcut, not text.
+        assert_eq!(
+            edit_message(Mode::Insert, &enter, None, keyboard::Modifiers::SHIFT),
+            Some(Message::Newline)
+        );
+        for modifiers in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ] {
+            for (key, text) in [
+                (ch("a"), Some("a")),
+                (backspace.clone(), None),
+                (enter.clone(), None),
+            ] {
+                assert_eq!(edit_message(Mode::Insert, &key, text, modifiers), None);
+            }
+        }
+        // Normal mode never edits.
+        for (key, text) in [
+            (ch("a"), Some("a")),
+            (ch("x"), Some("x")),
+            (backspace.clone(), Some("\u{8}")),
+            (enter, Some("\r")),
+        ] {
+            assert_eq!(edit_message(Mode::Normal, &key, text, none), None);
+        }
+        // The keys the other tables own are not edits.
+        for named in [
+            Named::Escape,
+            Named::ArrowLeft,
+            Named::ArrowRight,
+            Named::ArrowUp,
+            Named::ArrowDown,
+            Named::F1,
+            Named::F2,
+            Named::F3,
+            Named::F4,
+            Named::F5,
+        ] {
+            assert_eq!(
+                edit_message(Mode::Insert, &Key::Named(named), None, none),
+                None,
+                "{named:?}"
+            );
         }
     }
 
@@ -2465,12 +2598,39 @@ mod tests {
         assert_eq!(
             tapped(&app, ch("l")),
             [],
-            "typing is T8; `l` is not a motion here"
+            "`l` is not a motion here, and a bare tap carries no text"
         );
         assert_eq!(
             tapped(&app, Key::Named(Named::F3)),
             [Message::Toggle(Toggle::F3)]
         );
+    }
+
+    #[test]
+    fn typed_text_backspace_and_enter_reach_the_app_in_insert_mode_only() {
+        let text = |t: &str| Message::InsertText(t.to_string());
+        // `typewrite` sends real key events with their text.
+        let app = inserting(SPIKE);
+        let mut ui = iced_test::simulator(app.view());
+        ui.typewrite("x Y:é");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert_eq!(
+            messages,
+            [text("x"), text(" "), text("Y"), text(":"), text("é")]
+        );
+        let app = inserting(SPIKE);
+        assert_eq!(
+            tapped(&app, Key::Named(Named::Backspace)),
+            [Message::Backspace]
+        );
+        assert_eq!(tapped(&app, Key::Named(Named::Enter)), [Message::Newline]);
+        // Normal mode: the same keys do nothing (`l` and `h` there are motions, not text).
+        let app = App::new(SPIKE.to_string());
+        let mut ui = iced_test::simulator(app.view());
+        ui.typewrite("xY:");
+        assert_eq!(ui.into_messages().count(), 0);
+        assert_eq!(tapped(&app, Key::Named(Named::Backspace)), []);
+        assert_eq!(tapped(&app, Key::Named(Named::Enter)), []);
     }
 
     #[test]
@@ -2526,7 +2686,7 @@ mod tests {
                     };
                     goals.push(*goal_x);
                     assert!(goal_x.is_some());
-                    app.update(messages[0]);
+                    app.update(messages[0].clone());
                     let _ = app.view();
                     assert!(*offset <= SPIKE.len());
                 }
@@ -2623,7 +2783,7 @@ mod tests {
     #[test]
     fn draws_every_mode_flag_and_cursor_state_without_panicking() {
         // Cursor, bar, tail-row bar and overlay ticks, through the real renderer.
-        let states: [(&str, &[Message]); 6] = [
+        let states: [(&str, &[Message]); 7] = [
             (SPIKE, &[]),
             (
                 SPIKE,
@@ -2651,11 +2811,21 @@ mod tests {
                 ],
             ),
             ("", &[Message::Toggle(Toggle::F3), Message::EnterInsert]),
+            // The overlay with a perf line (after an edit) and the layout time.
+            (
+                "ab\n",
+                &[
+                    Message::Toggle(Toggle::F3),
+                    Message::EnterInsert,
+                    Message::InsertText("x".to_string()),
+                    Message::Newline,
+                ],
+            ),
         ];
         for (text, messages) in states {
             let mut app = App::new(text.to_string());
             for m in messages {
-                app.update(*m);
+                app.update(m.clone());
             }
             iced_test::simulator(app.view())
                 .snapshot(&Theme::Light)
